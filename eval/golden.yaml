@@ -1,0 +1,151 @@
+# Golden set for the Northwind handbook.
+#
+# Relevance is judged at document level: which page a support engineer would open to
+# answer the question. Multiple relevant docs are allowed when the answer genuinely
+# spans pages. These judgements were written by hand against the corpus, not generated
+# from the retriever, which is the only way the numbers mean anything.
+#
+# Add a case whenever a real query fails in production. The set should grow over time;
+# a golden set that never changes has stopped representing reality.
+
+k: 5
+
+cases:
+  - id: batch-size
+    question: How many events can I send in a single request?
+    relevant: [events-api]
+
+  - id: payload-limit
+    question: What is the maximum payload size for an ingestion batch?
+    relevant: [events-api]
+    note: paraphrase of batch-size; no shared keywords with "500 events"
+
+  - id: throttled
+    question: How do I stop my integration from getting throttled?
+    relevant: [rate-limits]
+    note: paraphrase; "throttled" never appears in the corpus
+
+  - id: rate-limit-response
+    question: What happens when I exceed the rate limit?
+    relevant: [rate-limits]
+
+  - id: retention-free
+    question: How long are events kept on the free plan?
+    relevant: [overview, billing]
+
+  - id: key-rotation
+    question: How do I rotate an API key without downtime?
+    relevant: [authentication]
+
+  - id: missing-events
+    question: Why do my events return 202 but never show up on the dashboard?
+    relevant: [troubleshooting, quickstart]
+
+  - id: funnel-steps
+    question: What is the maximum number of steps in a funnel?
+    relevant: [funnels]
+
+  - id: funnel-window
+    question: What is the default conversion window for a funnel?
+    relevant: [funnels]
+
+  - id: overage-pricing
+    question: How much does event overage cost on the Growth plan?
+    relevant: [billing]
+
+  - id: webhook-signature
+    question: How do I verify that a webhook came from Northwind?
+    relevant: [webhooks]
+
+  - id: webhook-retries
+    question: What retry schedule do failed webhook deliveries use?
+    relevant: [webhooks]
+
+  - id: cohort-refresh
+    question: How often are dynamic cohorts recalculated?
+    relevant: [cohorts]
+
+  - id: export-s3
+    question: How do I export events to my own S3 bucket?
+    relevant: [data-export]
+
+  - id: backfill
+    question: Can I backfill events older than 30 days?
+    relevant: [events-api]
+
+  - id: anomaly-alerts
+    question: How does anomaly detection decide that a metric is unusual?
+    relevant: [alerts]
+
+  - id: limit-vs-quota
+    question: What is the difference between a rate limit and a quota?
+    relevant: [rate-limits]
+
+  - id: sso-setup
+    question: How do I set up SAML single sign-on with Okta?
+    relevant: [sso]
+
+  - id: seat-billing
+    question: Are viewers billed as seats?
+    relevant: [billing]
+
+  - id: numbers-changed
+    question: My numbers keep changing for past dates, is that a bug?
+    relevant: [troubleshooting, funnels]
+    note: paraphrase-heavy; tests whether hybrid beats pure lexical
+
+  - id: timezone
+    question: What timezone are timestamps stored in?
+    relevant: [troubleshooting]
+
+  - id: tile-limit
+    question: How many tiles can a dashboard have?
+    relevant: [dashboards]
+
+  - id: duplicate-events
+    question: How do I prevent duplicate events when a request is retried?
+    relevant: [events-api, troubleshooting]
+
+  - id: key-scopes
+    question: What scopes can an API key have?
+    relevant: [authentication]
+
+  - id: free-quota
+    question: What happens if I exceed the monthly event quota on the Free plan?
+    relevant: [billing, rate-limits]
+
+  - id: anomaly-history
+    question: How many days of history do anomaly alerts need before they work?
+    relevant: [alerts]
+
+  - id: export-dedup
+    question: How should I deduplicate exported Parquet files?
+    relevant: [data-export]
+
+  - id: cohort-size
+    question: What is the maximum size of a cohort?
+    relevant: [cohorts]
+
+  - id: embed-dashboard
+    question: How do I embed a dashboard in another website?
+    relevant: [dashboards]
+
+  - id: sso-api-keys
+    question: Does enforcing SSO affect API keys?
+    relevant: [sso]
+
+  - id: webhook-downtime
+    question: What happens if my webhook endpoint is down for a whole day?
+    relevant: [webhooks]
+
+  - id: dashboard-cost
+    question: How do I make dashboard queries cheaper and faster?
+    relevant: [dashboards]
+
+  - id: rejected-events
+    question: Where can I see which events in a batch were rejected?
+    relevant: [events-api]
+
+  - id: scim
+    question: How does SCIM group mapping assign roles?
+    relevant: [sso]
