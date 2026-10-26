@@ -24,6 +24,7 @@ from .evaluation import (
     run_answer_eval,
 )
 from .ingest import build_index, load_index, save_index
+from .judges import get_judge
 from .providers import get_provider
 
 
@@ -62,6 +63,8 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     collection = normalize_collection(args.collection, settings.default_collection)
     destination = Path(args.out) if args.out else settings.index_path_for(collection)
     embedder = get_embedder(args.embedder)
+    if args.ocr:
+        os.environ["CITE_PDF_OCR"] = args.ocr
 
     previous = None
     if destination.exists() and not args.full:
@@ -162,12 +165,18 @@ def cmd_eval(args: argparse.Namespace) -> int:
     report = render_markdown(results, index.embedder.name)
 
     if not args.no_answers:
+        try:
+            support_judge = get_judge(args.judge or settings.judge)
+        except ValueError as exc:
+            print(f"[cite] {exc}", file=sys.stderr)
+            return 2
         answer_result = run_answer_eval(
             index,
             golden.cases,
             provider=get_provider(args.provider),
             k=golden.k,
             mode="auto",
+            judge=support_judge,
         )
         report += "\n\n### Answer-level checks\n\n" + render_answer_markdown([answer_result])
 
@@ -198,7 +207,12 @@ def cmd_info(args: argparse.Namespace) -> int:
     print(f"collections: {', '.join(settings.collection_names())}")
     print(
         f"auth: {'enabled' if settings.auth_enabled else 'disabled'} | "
-        f"rate limit: {settings.rate_limit_per_minute}/min per identity"
+        f"roles: {'admin keys configured' if settings.admin_keys else 'no admin map'} | "
+        f"acls: {'configured' if settings.key_acls else 'open to valid keys'}"
+    )
+    print(
+        f"rate limit: {settings.rate_limit_per_minute}/min per identity "
+        f"({settings.rate_limit_backend}) | judge: {settings.judge}"
     )
     if index_path.exists():
         index = _open_index(index_path, args.embedder)
@@ -207,7 +221,8 @@ def cmd_info(args: argparse.Namespace) -> int:
         )
         print(
             f"loaded: {documents} documents, {len(index)} chunks, "
-            f"embedder={index.embedder.name}, vectors={len(index.dense.vectors)}"
+            f"embedder={index.embedder.name}, vectors={len(index.dense.vectors)}, "
+            f"store={index_path.suffix.lstrip('.') or 'json'}"
         )
     return 0
 
@@ -230,6 +245,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="ignore the previous manifest and re-embed every chunk",
     )
+    ingest.add_argument(
+        "--ocr",
+        choices=["auto", "always", "off"],
+        help="scanned-PDF OCR mode; overrides CITE_PDF_OCR for this run",
+    )
     ingest.set_defaults(func=cmd_ingest)
 
     ask = subparsers.add_parser("ask", help="ask a question against the index")
@@ -246,6 +266,12 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--collection", default=settings.default_collection)
     evaluate.add_argument("--golden", default=str(settings.golden_path))
     evaluate.add_argument("--provider", default=None)
+    evaluate.add_argument(
+        "--judge",
+        choices=["lexical", "openai", "anthropic"],
+        default=None,
+        help="support judge; lexical is offline and is the default",
+    )
     evaluate.add_argument(
         "--no-answers",
         action="store_true",

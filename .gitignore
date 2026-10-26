@@ -11,10 +11,15 @@ dist/
 
 # Generated artefacts
 data/index.json
+data/index.sqlite3
+data/index.sqlite3-*
 data/collections/
 data/usage.db
 data/usage.db-wal
 data/usage.db-shm
+data/rate-limit.db
+data/rate-limit.db-wal
+data/rate-limit.db-shm
 
 # Frontend
 frontend/node_modules/

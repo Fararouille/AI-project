@@ -25,6 +25,30 @@ Rules:
    "I could not find that in the provided sources."
 4. Be concise: at most four sentences. Do not repeat the question."""
 
+JUDGE_PROMPT = """You check whether evidence supports a claim.
+
+Reply with exactly one word: SUPPORTED or UNSUPPORTED.
+SUPPORTED means the evidence, read plainly, entails the claim.
+UNSUPPORTED means it contradicts the claim or does not contain it.
+Do not use outside knowledge."""
+
+
+def parse_judgement(text: str) -> bool:
+    """Map a model reply to a boolean. Ambiguity resolves to unsupported."""
+    value = text.strip().upper()
+    if value.startswith("SUPPORTED"):
+        return True
+    if value.startswith("UNSUPPORTED"):
+        return False
+    return False
+
+
+def judge_user_prompt(claim: str, evidence: Sequence[str]) -> str:
+    passages = "\n\n".join(
+        f"[{index}] {passage}" for index, passage in enumerate(evidence, start=1)
+    )
+    return f"Evidence:\n\n{passages}\n\nClaim: {claim}"
+
 
 @dataclass(frozen=True, slots=True)
 class GenerationResult:
@@ -176,6 +200,33 @@ class OpenAIProvider:
             ),
         )
 
+    def judge_claim(self, claim: str, evidence: Sequence[str]) -> bool:
+        """Ask the model whether the evidence entails the claim. Cost is not metered."""
+        import httpx
+
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set; use CITE_JUDGE=lexical")
+
+        payload = {
+            "model": self.model,
+            "temperature": 0.0,
+            "max_tokens": 4,
+            "messages": [
+                {"role": "system", "content": JUDGE_PROMPT},
+                {"role": "user", "content": judge_user_prompt(claim, evidence)},
+            ],
+        }
+        with httpx.Client(timeout=90.0) as client:
+            response = client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=payload,
+            )
+            response.raise_for_status()
+            body = response.json()
+        return parse_judgement(body["choices"][0]["message"]["content"])
+
 
 class AnthropicProvider:
     name = "anthropic"
@@ -234,6 +285,42 @@ class AnthropicProvider:
                 + tokens_out / 1_000_000 * self.output_cost_per_million
             ),
         )
+
+    def judge_claim(self, claim: str, evidence: Sequence[str]) -> bool:
+        """Ask the model whether the evidence entails the claim. Cost is not metered."""
+        import httpx
+
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY is not set; use CITE_JUDGE=lexical")
+
+        payload = {
+            "model": self.model,
+            "max_tokens": 8,
+            "temperature": 0.0,
+            "system": JUDGE_PROMPT,
+            "messages": [
+                {"role": "user", "content": judge_user_prompt(claim, evidence)}
+            ],
+        }
+        with httpx.Client(timeout=90.0) as client:
+            response = client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            body = response.json()
+        text = "".join(
+            block.get("text", "")
+            for block in body.get("content", [])
+            if block.get("type") == "text"
+        )
+        return parse_judgement(text)
 
 
 def get_provider(name: str | None = None) -> Provider:

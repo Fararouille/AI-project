@@ -152,3 +152,4 @@ class AnswerResult:
     fact_recall: float
     fact_cases: int
     cases: list[AnswerCaseScore] = field(default_factory=list)
+    judge: str = "lexical"

@@ -37,6 +37,8 @@ def configured(monkeypatch, tmp_path):
         collections_dir=tmp_path / "collections",
         usage_db_path=tmp_path / "usage.db",
         rate_limit_per_minute=0,
+        rate_limit_backend="memory",
+        rate_limit_db_path=tmp_path / "rate-limit.db",
     )
     monkeypatch.setattr(api_module.state, "settings", settings)
     api_module.state.index = make_index()
@@ -236,3 +238,107 @@ def test_sources_unknown_collection_is_404(configured) -> None:
     response = client.get("/api/sources?collection=nope")
     assert response.status_code == 404
     assert "available" in response.json()["detail"]
+
+
+def _acl_settings(settings):
+    return replace(
+        settings,
+        api_keys=("reader-key", "admin-key", "unlisted-key"),
+        admin_keys=("admin-key",),
+        key_acls=(("reader-key", ("default",)),),
+    )
+
+
+def test_reader_key_is_limited_to_its_collections(configured) -> None:
+    client, settings = configured
+    api_module.state.collections["support"] = make_index(
+        "support", "Support replies within four hours."
+    )
+    api_module.state.settings = _acl_settings(settings)
+
+    allowed = client.post(
+        "/api/ask",
+        json={"question": "How many requests per minute?"},
+        headers={"X-API-Key": "reader-key"},
+    )
+    denied = client.post(
+        "/api/ask",
+        json={"question": "How fast does support reply?", "collection": "support"},
+        headers={"X-API-Key": "reader-key"},
+    )
+    assert allowed.status_code == 200
+    assert denied.status_code == 403
+    assert "not allowed to read collection 'support'" in denied.json()["detail"]
+    assert (
+        client.get(
+            "/api/sources?collection=support", headers={"X-API-Key": "reader-key"}
+        ).status_code
+        == 403
+    )
+
+
+def test_admin_key_can_read_every_collection(configured) -> None:
+    client, settings = configured
+    api_module.state.collections["support"] = make_index(
+        "support", "Support replies within four hours."
+    )
+    api_module.state.settings = _acl_settings(settings)
+
+    response = client.post(
+        "/api/ask",
+        json={"question": "How fast does support reply?", "collection": "support"},
+        headers={"X-API-Key": "admin-key"},
+    )
+    assert response.status_code == 200
+    assert response.json()["citations"][0]["doc_id"] == "support"
+
+
+def test_reader_key_cannot_mutate_or_read_admin_endpoints(configured) -> None:
+    client, settings = configured
+    api_module.state.settings = _acl_settings(settings)
+    headers = {"X-API-Key": "reader-key"}
+
+    reindex = client.post("/api/reindex", json={}, headers=headers)
+    evaluation = client.post("/api/eval", headers=headers)
+    usage = client.get("/api/usage", headers=headers)
+    assert reindex.status_code == 403
+    assert evaluation.status_code == 403
+    assert usage.status_code == 403
+    assert "admin role required" in reindex.json()["detail"]
+
+
+def test_unlisted_key_gets_no_collections(configured) -> None:
+    client, settings = configured
+    api_module.state.settings = _acl_settings(settings)
+    response = client.post(
+        "/api/ask",
+        json={"question": "How many requests per minute?"},
+        headers={"X-API-Key": "unlisted-key"},
+    )
+    assert response.status_code == 403
+    me = client.get("/api/me", headers={"X-API-Key": "unlisted-key"}).json()
+    assert me["role"] == "reader"
+    assert me["collections"] == []
+
+
+def test_me_reports_admin_when_auth_is_disabled(configured) -> None:
+    client, _ = configured
+    body = client.get("/api/me").json()
+    assert body["role"] == "admin"
+    assert body["collections"] is None
+
+
+def test_me_reports_reader_grants(configured) -> None:
+    client, settings = configured
+    api_module.state.collections["support"] = make_index("support", "Support is fast.")
+    api_module.state.settings = _acl_settings(settings)
+    body = client.get("/api/me", headers={"X-API-Key": "reader-key"}).json()
+    assert body["role"] == "reader"
+    assert body["collections"] == ["default"]
+
+
+def test_health_reports_limiter_and_judge(configured) -> None:
+    client, _ = configured
+    body = client.get("/api/health").json()
+    assert body["rate_limit_backend"] == "memory"
+    assert body["judge"] == "lexical"

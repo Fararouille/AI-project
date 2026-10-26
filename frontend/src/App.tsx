@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   askStream,
+  getApiKey,
   getHealth,
   getSources,
   runEvaluation,
+  setApiKey,
   type AskResult,
   type EvalResponse,
   type Health,
@@ -72,11 +74,17 @@ export default function App() {
 
   const [evaluation, setEvaluation] = useState<EvalResponse | null>(null);
   const [evalBusy, setEvalBusy] = useState(false);
+  const [apiKey, setApiKeyValue] = useState(getApiKey);
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     getHealth().then(setHealth).catch((err: Error) => setError(err.message));
     getSources().then(setSources).catch(() => setSources([]));
+  }, [apiKey]);
+
+  const updateApiKey = useCallback((value: string) => {
+    setApiKeyValue(value);
+    setApiKey(value);
   }, []);
 
   const submit = useCallback(
@@ -138,15 +146,28 @@ export default function App() {
           <span className="brand-mark">]</span>
           <span className="brand-tag">answers with receipts</span>
         </div>
-        <div className="status">
-          {health ? (
-            <>
-              <span className={`dot dot-${health.status}`} />
-              {health.documents} docs · {health.chunks} chunks · {health.embedder}
-            </>
-          ) : (
-            <span>connecting…</span>
-          )}
+        <div className="header-meta">
+          <label className="api-key" title="Stored in this browser only">
+            <span>key</span>
+            <input
+              type="password"
+              value={apiKey}
+              onChange={(event) => updateApiKey(event.target.value)}
+              placeholder="optional"
+              aria-label="API key"
+              autoComplete="off"
+            />
+          </label>
+          <div className="status">
+            {health ? (
+              <>
+                <span className={`dot dot-${health.status}`} />
+                {health.documents} docs · {health.chunks} chunks · {health.embedder}
+              </>
+            ) : (
+              <span>connecting…</span>
+            )}
+          </div>
         </div>
       </header>
 

@@ -16,16 +16,22 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Tesseract is a system binary; the Python wrappers are in the optional [ocr]
+# extra. Installing both keeps scanned PDFs working in the container.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY data/corpus ./data/corpus
 COPY eval ./eval
-RUN pip install ".[loaders]"
+RUN pip install ".[loaders,ocr]"
 
 COPY --from=ui /ui/dist ./frontend/dist
 
 # Bake the index at build time so first boot is instant and deterministic.
-RUN python -m cite ingest --corpus data/corpus --out data/index.json
+RUN python -m cite ingest --corpus data/corpus --out data/index.sqlite3
 
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \

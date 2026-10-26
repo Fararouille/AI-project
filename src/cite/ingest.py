@@ -34,6 +34,7 @@ from .embeddings import Embedder, get_embedder
 from .loaders import SUPPORTED_SUFFIXES, load_document
 from .models import Document
 from .retrieval import Index
+from .store import is_sqlite_path
 from .text import normalize
 
 MANIFEST_VERSION = 1
@@ -59,6 +60,11 @@ class BuildStats:
     full_rebuild: bool
     reason: str
     elapsed_ms: float
+    # Document ids, so a SQLite store can upsert only what changed. They stay out
+    # of ``as_dict`` because a 5,000-document response does not need them.
+    added_doc_ids: tuple[str, ...] = ()
+    changed_doc_ids: tuple[str, ...] = ()
+    removed_doc_ids: tuple[str, ...] = ()
 
     def as_dict(self) -> dict:
         return {
@@ -190,6 +196,8 @@ def build_index(
     manifest_documents: dict[str, dict] = {}
     added = changed = unchanged = 0
     reused_chunks = embedded_chunks = 0
+    added_ids: list[str] = []
+    changed_ids: list[str] = []
 
     for document in documents:
         fingerprint = _fingerprint(document)
@@ -216,8 +224,10 @@ def build_index(
 
         if record is not None and reuse:
             changed += 1
+            changed_ids.append(document.doc_id)
         else:
             added += 1
+            added_ids.append(document.doc_id)
 
         fresh = chunk_document(document, max_words, overlap_words)
         fresh_vectors = embedder.embed([chunk.text for chunk in fresh]) if fresh else []
@@ -231,15 +241,20 @@ def build_index(
         }
 
     removed = 0
+    removed_ids: list[str] = []
     if reuse:
-        removed = len(set(previous_documents) - set(manifest_documents))
+        removed_ids = sorted(set(previous_documents) - set(manifest_documents))
+        removed = len(removed_ids)
     elif previous is not None:
-        removed = len(previous.manifest.get("documents", {}))
+        removed_ids = sorted(previous.manifest.get("documents", {}))
+        removed = len(removed_ids)
 
     if not reuse:
         # In a full rebuild every document is embedded, not "added" relative to
         # an index we explicitly refused to trust.
         added, changed, unchanged = len(documents), 0, 0
+        added_ids = [document.doc_id for document in documents]
+        changed_ids = []
         reused_chunks = 0
         embedded_chunks = len(chunks)
 
@@ -270,13 +285,26 @@ def build_index(
         full_rebuild=not reuse,
         reason=reason,
         elapsed_ms=(time.perf_counter() - started) * 1000.0,
+        added_doc_ids=tuple(added_ids),
+        changed_doc_ids=tuple(changed_ids),
+        removed_doc_ids=tuple(removed_ids),
     )
     return index
 
 
-def save_index(index: Index, path: str | Path) -> Path:
-    """Write the index atomically: temp file first, then ``os.replace``."""
+def save_index(index: Index, path: str | Path, *, incremental: bool = True) -> Path:
+    """Write an index atomically, choosing the store from the file suffix.
+
+    ``.sqlite3`` / ``.sqlite`` / ``.db`` use the per-document SQLite store; every
+    other suffix keeps the original JSON format, written through a temp file and
+    ``os.replace``.
+    """
     destination = Path(path)
+    if is_sqlite_path(destination):
+        from .store import save_sqlite_index
+
+        return save_sqlite_index(index, destination, incremental=incremental)
+
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(index.to_dict(), indent=2) + "\n"
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
@@ -299,7 +327,13 @@ def load_index(
     ``require_match=False`` is used by the ingester: it needs the previous chunks
     and manifest even when the embedder has changed, so it can decide to rebuild.
     """
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    source = Path(path)
+    if is_sqlite_path(source):
+        from .store import load_sqlite_index
+
+        return load_sqlite_index(source, embedder, require_match=require_match)
+
+    payload = json.loads(source.read_text(encoding="utf-8"))
     stored_name = payload.get("embedder")
     stored_dim = int(payload.get("dim", 0)) or None
     resolved = embedder or get_embedder(stored_name)

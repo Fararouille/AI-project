@@ -49,10 +49,35 @@ export type EvalResponse = {
   results: EvalRow[];
 };
 
-const JSON_HEADERS = { "Content-Type": "application/json" };
+const API_KEY_STORAGE = "cite.apiKey";
+
+export function getApiKey(): string {
+  try {
+    return localStorage.getItem(API_KEY_STORAGE) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+export function setApiKey(key: string): void {
+  try {
+    if (key) localStorage.setItem(API_KEY_STORAGE, key);
+    else localStorage.removeItem(API_KEY_STORAGE);
+  } catch {
+    // Private-mode browsers can reject storage; the in-memory state still works.
+  }
+}
+
+function headers(init?: RequestInit): Headers {
+  const merged = new Headers(init?.headers);
+  if (!merged.has("Content-Type")) merged.set("Content-Type", "application/json");
+  const key = getApiKey();
+  if (key) merged.set("X-API-Key", key);
+  return merged;
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, init);
+  const response = await fetch(path, { ...init, headers: headers(init) });
   if (!response.ok) {
     const detail = await response.text();
     throw new Error(detail || `${response.status} ${response.statusText}`);
@@ -76,7 +101,6 @@ export type AskOptions = {
 export function ask(options: AskOptions): Promise<AskResult> {
   return request<AskResult>("/api/ask", {
     method: "POST",
-    headers: JSON_HEADERS,
     body: JSON.stringify(options),
   });
 }
@@ -93,7 +117,7 @@ export async function askStream(
 ): Promise<AskResult> {
   const response = await fetch("/api/ask/stream", {
     method: "POST",
-    headers: JSON_HEADERS,
+    headers: headers(),
     body: JSON.stringify(options),
     signal,
   });

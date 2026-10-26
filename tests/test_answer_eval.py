@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import replace
 
 import pytest
@@ -177,3 +178,47 @@ def test_missing_retrieved_context_scores_zero_support() -> None:
 def test_empty_answer_is_not_answered(text: str) -> None:
     answer = make_answer(text, "Widgets cost $5.")
     assert score_answer(answer, case()).answered is False
+
+
+class FixedJudge:
+    def __init__(self, name: str, verdict: bool) -> None:
+        self.name = name
+        self.verdict = verdict
+
+    def supports(self, claim: str, evidence: Sequence[str]) -> bool:
+        return self.verdict
+
+
+def test_a_model_judge_replaces_the_lexical_support_decision() -> None:
+    answer = make_answer(
+        "Widgets cost $5 per month. [1]", "Widgets are blue and have three corners."
+    )
+    lexical = score_answer(answer, case())
+    generous = score_answer(answer, case(), judge=FixedJudge("fake", True))
+    assert lexical.support_rate == 0.0
+    assert generous.support_rate == 1.0
+
+
+def test_answer_result_records_which_judge_ran() -> None:
+    chunk = Chunk(
+        chunk_id="c1",
+        doc_id="pricing",
+        doc_title="Pricing",
+        heading="Rates",
+        ordinal=0,
+        body="Widgets cost $5 per month.",
+        text="Pricing\nRates\nWidgets cost $5 per month.",
+    )
+    index = Index([chunk], HashingEmbedder(dim=64))
+    result = run_answer_eval(
+        index,
+        [case(question="How much do widgets cost?", relevant_docs=("pricing",))],
+        provider=MockProvider(),
+        k=1,
+        judge=FixedJudge("hosted", True),
+    )
+    assert result.judge == "hosted"
+    table = render_answer_markdown([result])
+    assert "Model support" in table
+    assert "support judge = hosted" in table
+    assert "model judgement is not ground truth" in table

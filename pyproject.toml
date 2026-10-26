@@ -21,8 +21,12 @@ dev = [
     "ruff>=0.4",
     "pypdf>=4.0",
     "beautifulsoup4>=4.12",
+    "pymupdf>=1.24",
+    "pytesseract>=0.3.10",
+    "Pillow>=10.0",
 ]
 loaders = ["pypdf>=4.0", "beautifulsoup4>=4.12"]
+ocr = ["pymupdf>=1.24", "pytesseract>=0.3.10", "Pillow>=10.0"]
 
 [project.scripts]
 cite = "cite.cli:main"
@@ -44,3 +48,6 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query"]

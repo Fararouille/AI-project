@@ -5,13 +5,15 @@ That is the right amount of infrastructure for a single-node document QA service
 The hardening here is deliberately bounded:
 
 * optional API keys (``CITE_API_KEYS``) on every endpoint that can spend money
-* an in-process token bucket per identity (``CITE_RATE_LIMIT_PER_MINUTE``)
+* per-key collection ACLs and an admin role (``CITE_KEY_ACLS`` / ``CITE_ADMIN_KEYS``)
+* token buckets shared by all workers on a host through SQLite by default
 * a SQLite query log with an aggregate ``/api/usage`` endpoint
 * named collections stored as separate index files, so one corpus cannot leak
   into another through a shared id space
+* SQLite or JSON index storage, chosen by the configured file suffix
 
 What is still missing for real multi-tenancy is listed in the README: per-tenant
-embedding budgets, a shared vector store, and a reindex queue.
+embedding budgets, a shared vector server, and a reindex queue.
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .answer import answer_question
-from .config import Settings, normalize_collection
+from .config import Principal, Settings, normalize_collection
 from .embeddings import Embedder, get_embedder
 from .evaluation import (
     load_golden,
@@ -49,61 +51,13 @@ from .evaluation import (
     run_answer_eval,
 )
 from .ingest import build_index, load_index, save_index
+from .judges import get_judge
 from .models import Answer, ConfigResult
 from .providers import get_provider
+from .ratelimit import Limiter, build_limiter
 from .retrieval import Index
 
 FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend" / "dist"
-
-
-# --------------------------------------------------------------------------- rate limiting
-class TokenBucket:
-    __slots__ = ("capacity", "rate", "tokens", "updated")
-
-    def __init__(self, per_minute: int) -> None:
-        self.capacity = float(per_minute)
-        self.rate = per_minute / 60.0
-        self.tokens = float(per_minute)
-        self.updated = time.monotonic()
-
-    def consume(self, now: float) -> tuple[bool, float]:
-        elapsed = max(0.0, now - self.updated)
-        self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
-        self.updated = now
-        if self.tokens >= 1.0:
-            self.tokens -= 1.0
-            return True, 0.0
-        wait = (1.0 - self.tokens) / self.rate if self.rate else 0.0
-        return False, wait
-
-
-class RateLimiter:
-    """Per-identity token bucket. Memory-only on purpose: one process, no Redis."""
-
-    def __init__(self, per_minute: int) -> None:
-        self.per_minute = per_minute
-        self._buckets: dict[str, TokenBucket] = {}
-        self._lock = threading.Lock()
-
-    def consume(self, identity: str) -> tuple[bool, int]:
-        if self.per_minute <= 0:
-            return True, 0
-        now = time.monotonic()
-        with self._lock:
-            self._prune(now)
-            bucket = self._buckets.get(identity)
-            if bucket is None:
-                bucket = TokenBucket(self.per_minute)
-                self._buckets[identity] = bucket
-            allowed, wait = bucket.consume(now)
-        return allowed, max(0, math.ceil(wait))
-
-    def _prune(self, now: float) -> None:
-        if len(self._buckets) < 4096:
-            return
-        stale = [key for key, bucket in self._buckets.items() if now - bucket.updated > 3600]
-        for key in stale:
-            del self._buckets[key]
 
 
 # --------------------------------------------------------------------------- usage store
@@ -250,7 +204,8 @@ class AppState:
     last_eval: list[ConfigResult] | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
     settings: Settings | None = None
-    limiter: RateLimiter | None = None
+    limiter: Limiter | None = None
+    limiter_key: tuple[int, str, str] | None = None
     usage: UsageStore | None = None
     default_collection: str = "default"
 
@@ -275,12 +230,38 @@ def _collection(name: str | None) -> str:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _migrate_legacy_json(settings: Settings) -> Path | None:
+    """Move a pre-SQLite ``index.json`` to the configured path once.
+
+    The default store changed from JSON to SQLite. Rebuilding would re-embed the
+    corpus, which is free with the hashing embedder and expensive with a hosted
+    one, so an existing sibling JSON index is loaded and written to the new path.
+    """
+    legacy = settings.index_path.with_suffix(".json")
+    if (
+        legacy == settings.index_path
+        or not legacy.exists()
+        or settings.index_path.suffix.lower() == ".json"
+    ):
+        return None
+    try:
+        index = load_index(legacy, _configured_embedder())
+        save_index(index, settings.index_path)
+    except Exception as exc:  # a bad legacy file must not block startup
+        print(f"[cite] could not migrate {legacy}: {exc}")
+        return None
+    print(f"[cite] migrated {legacy} -> {settings.index_path}")
+    return settings.index_path
+
+
 def load_or_build_indexes() -> dict[str, Index]:
     settings = _settings()
     state.settings = settings
     state.default_collection = settings.default_collection
     indexes: dict[str, Index] = {}
 
+    if not settings.index_path.exists():
+        _migrate_legacy_json(settings)
     if settings.index_path.exists():
         indexes[settings.default_collection] = load_index(
             settings.index_path, _configured_embedder()
@@ -294,15 +275,14 @@ def load_or_build_indexes() -> dict[str, Index]:
         save_index(index, settings.index_path)
         indexes[settings.default_collection] = index
 
-    if settings.collections_dir.exists():
-        for path in sorted(settings.collections_dir.glob("*.json")):
-            name = path.stem
-            if name in indexes:
-                continue
-            try:
-                indexes[name] = load_index(path, _configured_embedder())
-            except Exception as exc:  # one bad collection must not hide the rest
-                print(f"[cite] skipped collection {name!r}: {exc}")
+    for path in settings.collection_paths():
+        name = path.stem
+        if name in indexes or name == settings.default_collection:
+            continue
+        try:
+            indexes[name] = load_index(path, _configured_embedder())
+        except Exception as exc:  # one bad collection must not hide the rest
+            print(f"[cite] skipped collection {name!r}: {exc}")
 
     state.collections = indexes
     state.index = indexes.get(settings.default_collection)
@@ -354,37 +334,54 @@ def _presented_key(request: Request) -> str | None:
     return None
 
 
-def require_identity(request: Request) -> str:
-    """Authenticate (when configured) and apply the token bucket.
+def _authenticate(request: Request, settings: Settings) -> tuple[str | None, str]:
+    """Return ``(presented_key, identity)`` or raise a 401."""
+    key = _presented_key(request)
+    if not settings.api_keys:
+        host = request.client.host if request.client else "unknown"
+        return None, f"ip:{host}"
+    if not key:
+        raise HTTPException(
+            status_code=401,
+            detail="missing API key; send X-API-Key or Authorization: Bearer <key>",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not any(
+        hmac.compare_digest(key.encode("utf-8"), candidate.encode("utf-8"))
+        for candidate in settings.api_keys
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="invalid API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return key, "key:" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
+def require_principal(request: Request) -> Principal:
+    """Authenticate (when configured), resolve ACLs, and apply the token bucket.
 
     Auth is disabled when ``CITE_API_KEYS`` is empty, so the default offline
-    install keeps working. Rate limiting still applies by client IP in that mode.
+    install keeps working and the anonymous local caller is an admin. Rate
+    limiting still applies by client IP in that mode.
     """
     settings = _settings()
-    key = _presented_key(request)
-    if settings.api_keys:
-        if not key:
-            raise HTTPException(
-                status_code=401,
-                detail="missing API key; send X-API-Key or Authorization: Bearer <key>",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        if not any(
-            hmac.compare_digest(key.encode("utf-8"), candidate.encode("utf-8"))
-            for candidate in settings.api_keys
-        ):
-            raise HTTPException(
-                status_code=401,
-                detail="invalid API key",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        identity = "key:" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
-    else:
-        host = request.client.host if request.client else "unknown"
-        identity = f"ip:{host}"
+    key, identity = _authenticate(request, settings)
+    principal = settings.principal(key, identity)
 
-    if state.limiter is None or state.limiter.per_minute != settings.rate_limit_per_minute:
-        state.limiter = RateLimiter(settings.rate_limit_per_minute)
+    wanted = (
+        settings.rate_limit_per_minute,
+        settings.rate_limit_backend,
+        str(settings.rate_limit_db_path),
+    )
+    if state.limiter is None or state.limiter_key != wanted:
+        state.limiter = build_limiter(
+            settings.rate_limit_per_minute,
+            settings.rate_limit_backend,
+            settings.rate_limit_db_path,
+        )
+        state.limiter_key = wanted
+
     allowed, retry_after = state.limiter.consume(identity)
     if not allowed:
         raise HTTPException(
@@ -392,7 +389,21 @@ def require_identity(request: Request) -> str:
             detail="rate limit exceeded",
             headers={"Retry-After": str(retry_after)},
         )
-    return identity
+    return principal
+
+
+def require_identity(principal: Principal = Depends(require_principal)) -> str:
+    """Backward-compatible dependency for callers that only need the identity."""
+    return principal.identity
+
+
+def require_admin(principal: Principal = Depends(require_principal)) -> Principal:
+    if not principal.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="admin role required; use a key listed in CITE_ADMIN_KEYS",
+        )
+    return principal
 
 
 def _usage_store(settings: Settings) -> UsageStore | None:
@@ -475,6 +486,14 @@ class HealthResponse(BaseModel):
     collections: list[CollectionInfo]
     auth_required: bool
     rate_limit_per_minute: int
+    rate_limit_backend: str
+    judge: str
+
+
+class MeResponse(BaseModel):
+    identity: str
+    role: str
+    collections: list[str] | None
 
 
 class ReindexRequest(BaseModel):
@@ -495,8 +514,15 @@ class UsageResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- helpers
-def _require_index(collection: str | None) -> tuple[str, Index]:
+def _require_index(
+    collection: str | None, principal: Principal
+) -> tuple[str, Index]:
     name = _collection(collection)
+    if not principal.can_read(name):
+        raise HTTPException(
+            status_code=403,
+            detail=f"API key is not allowed to read collection {name!r}",
+        )
     if name in state.collections:
         return name, state.collections[name]
     if state.index is not None and name == state.default_collection:
@@ -558,14 +584,35 @@ def health() -> HealthResponse:
         collections=collections,
         auth_required=settings.auth_enabled,
         rate_limit_per_minute=settings.rate_limit_per_minute,
+        rate_limit_backend=settings.rate_limit_backend,
+        judge=settings.judge,
+    )
+
+
+@app.get("/api/me", response_model=MeResponse)
+def me(principal: Principal = Depends(require_principal)) -> MeResponse:
+    """Tell an authenticated client what its key can do.
+
+    The bundled UI uses this to show a role badge instead of guessing from a 403.
+    Collection names are only revealed when the key may read them.
+    """
+    return MeResponse(
+        identity=principal.identity,
+        role=principal.role,
+        collections=(
+            None
+            if principal.collections is None
+            else sorted(principal.collections & state.collections.keys())
+        ),
     )
 
 
 @app.get("/api/sources")
 def sources(
-    collection: str | None = None, identity: str = Depends(require_identity)
+    collection: str | None = None,
+    principal: Principal = Depends(require_principal),
 ) -> list[dict]:
-    name, index = _require_index(collection)
+    name, index = _require_index(collection, principal)
     grouped: dict[str, dict] = {}
     for chunk in index.chunks:
         entry = grouped.setdefault(
@@ -585,8 +632,10 @@ def sources(
 
 
 @app.post("/api/ask", response_model=AskResponse)
-def ask(request: AskRequest, identity: str = Depends(require_identity)) -> AskResponse:
-    name, index = _require_index(request.collection)
+def ask(
+    request: AskRequest, principal: Principal = Depends(require_principal)
+) -> AskResponse:
+    name, index = _require_index(request.collection, principal)
     answer = answer_question(
         index,
         request.question,
@@ -595,15 +644,15 @@ def ask(request: AskRequest, identity: str = Depends(require_identity)) -> AskRe
         mode=request.mode,
         rerank=request.rerank,
     )
-    _record(answer, name, identity)
+    _record(answer, name, principal.identity)
     return _serialize(answer, name)
 
 
 @app.post("/api/ask/stream")
 async def ask_stream(
-    request: AskRequest, identity: str = Depends(require_identity)
+    request: AskRequest, principal: Principal = Depends(require_principal)
 ) -> StreamingResponse:
-    name, index = _require_index(request.collection)
+    name, index = _require_index(request.collection, principal)
     answer = answer_question(
         index,
         request.question,
@@ -612,7 +661,7 @@ async def ask_stream(
         mode=request.mode,
         rerank=request.rerank,
     )
-    _record(answer, name, identity)
+    _record(answer, name, principal.identity)
 
     async def events():
         # Tokens are chunked from a completed answer: the local provider is not a
@@ -631,9 +680,10 @@ async def ask_stream(
 def evaluate(
     answers: bool = False,
     collection: str | None = None,
-    identity: str = Depends(require_identity),
+    judge: str | None = None,
+    principal: Principal = Depends(require_admin),
 ) -> dict:
-    _, index = _require_index(collection)
+    _, index = _require_index(collection, principal)
     settings = _settings()
     try:
         golden = load_golden(settings.golden_path)
@@ -659,11 +709,21 @@ def evaluate(
         ],
     }
     if answers:
+        try:
+            support_judge = get_judge(judge or settings.judge)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         answer_result = run_answer_eval(
-            index, golden.cases, provider=get_provider(), k=golden.k, mode="auto"
+            index,
+            golden.cases,
+            provider=get_provider(),
+            k=golden.k,
+            mode="auto",
+            judge=support_judge,
         )
         payload["answer_markdown"] = render_answer_markdown([answer_result])
         payload["answers"] = {
+            "judge": answer_result.judge,
             "answered_rate": round(answer_result.answered_rate, 4),
             "grounded_rate": round(answer_result.grounded_rate, 4),
             "citation_precision": round(answer_result.citation_precision, 4),
@@ -677,11 +737,17 @@ def evaluate(
 
 @app.post("/api/reindex", response_model=ReindexResponse)
 def reindex(
-    request: ReindexRequest | None = None, identity: str = Depends(require_identity)
+    request: ReindexRequest | None = None,
+    principal: Principal = Depends(require_admin),
 ) -> ReindexResponse:
     settings = _settings()
     options = request or ReindexRequest()
     name = _collection(options.collection)
+    if not principal.can_read(name):
+        raise HTTPException(
+            status_code=403,
+            detail=f"API key is not allowed to read collection {name!r}",
+        )
     destination = settings.index_path_for(name)
     embedder = _configured_embedder() or get_embedder()
 
@@ -717,7 +783,7 @@ def reindex(
 @app.get("/api/usage", response_model=UsageResponse)
 def usage(
     hours: int = Query(default=24, ge=1, le=24 * 30),
-    identity: str = Depends(require_identity),
+    principal: Principal = Depends(require_admin),
 ) -> UsageResponse:
     settings = _settings()
     store = _usage_store(settings)

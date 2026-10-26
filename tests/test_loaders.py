@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import shutil
+import sys
 from pathlib import Path
 
 import pytest
 
 from cite.ingest import load_documents
 from cite.loaders import SUPPORTED_SUFFIXES, get_loader, load_document
+from cite.loaders.base import MissingLoaderDependency
 from cite.loaders.html import HTMLLoader
 from cite.loaders.markdown import MarkdownLoader
 from cite.loaders.pdf import PDFLoader
@@ -62,6 +65,72 @@ def test_pdf_extracts_pages_with_page_markers() -> None:
     assert "## Page 1" in loaded.text
     assert "Widgets are created with POST /v1/widgets." in loaded.text
     assert "250 widgets per day" in loaded.text
+
+
+def _write_scanned_pdf(path: Path) -> None:
+    """Render text to an image, then embed the image in a PDF with no text layer."""
+    pymupdf = pytest.importorskip("pymupdf")
+    source = pymupdf.open()
+    page = source.new_page(width=520, height=160)
+    page.insert_text((24, 90), "Scanned widget limit is 250 per day.", fontsize=20)
+    pixmap = page.get_pixmap(dpi=200)
+    scanned = pymupdf.open()
+    target = scanned.new_page(width=520, height=160)
+    target.insert_image(target.rect, pixmap=pixmap)
+    scanned.save(str(path))
+    scanned.close()
+    source.close()
+
+
+def test_scanned_pdf_with_ocr_off_fails_loudly(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "scanned.pdf"
+    _write_scanned_pdf(path)
+    monkeypatch.setenv("CITE_PDF_OCR", "off")
+    with pytest.raises(ValueError, match="no extractable text"):
+        load_document(path)
+    with pytest.raises(ValueError, match=r"\[ocr\]"):
+        load_document(path)
+
+
+def test_scanned_pdf_is_ocred_when_the_toolchain_is_installed(
+    tmp_path, monkeypatch
+) -> None:
+    pytest.importorskip("pytesseract")
+    pytest.importorskip("PIL")
+    if shutil.which("tesseract") is None:
+        pytest.skip("Tesseract binary is not installed")
+    path = tmp_path / "scanned.pdf"
+    _write_scanned_pdf(path)
+    monkeypatch.setenv("CITE_PDF_OCR", "auto")
+    text = load_document(path).text
+    assert "250" in text
+
+
+def _write_blank_pdf(path: Path) -> None:
+    pypdf = pytest.importorskip("pypdf")
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.write(str(path))
+
+
+def test_ocr_always_mode_explains_missing_dependencies(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "blank.pdf"
+    _write_blank_pdf(path)
+    for module in ("pymupdf", "fitz", "pytesseract"):
+        monkeypatch.setitem(sys.modules, module, None)
+    with pytest.raises(MissingLoaderDependency, match="OCR is required"):
+        PDFLoader(ocr="always").load(path)
+
+
+def test_ocr_auto_mode_still_fails_clearly_without_dependencies(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "blank.pdf"
+    _write_blank_pdf(path)
+    for module in ("pymupdf", "fitz", "pytesseract"):
+        monkeypatch.setitem(sys.modules, module, None)
+    with pytest.raises(ValueError, match=r"\[ocr\]"):
+        PDFLoader(ocr="auto").load(path)
 
 
 def test_unsupported_suffix_is_explicit(tmp_path) -> None:

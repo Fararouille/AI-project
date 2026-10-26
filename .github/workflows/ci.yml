@@ -14,12 +14,14 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install -e ".[dev,loaders]"
+      - name: Install Tesseract for the scanned-PDF integration test
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tesseract-ocr
+      - run: pip install -e ".[dev,loaders,ocr]"
       - run: ruff check src tests scripts
       - run: pytest -q
       - name: Build index and run the benchmark
         run: |
-          python -m cite ingest --corpus data/corpus --out data/index.json
+          python -m cite ingest --corpus data/corpus --out data/index.sqlite3
           python -m cite eval --out eval/results.md
           cat eval/results.md
       - name: Full rebuild vs incremental ingestion

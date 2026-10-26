@@ -24,6 +24,7 @@ from pathlib import Path
 import yaml
 
 from .answer import answer_question
+from .judges import SUPPORT_THRESHOLD, Judge, LexicalJudge
 from .models import (
     Answer,
     AnswerCaseScore,
@@ -35,13 +36,9 @@ from .models import (
 )
 from .providers import Provider, get_provider
 from .retrieval import Index
-from .text import terms
 
 DEFAULT_K = 5
 CITATION_RE = re.compile(r"\[(\d{1,2})\]")
-# A cited sentence counts as supported when at least this share of its content
-# terms appear in the cited chunk. This is a lexical proxy for entailment.
-SUPPORT_THRESHOLD = 0.60
 REFUSAL_MARKER = "could not find"
 
 
@@ -230,27 +227,34 @@ def _normalized(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip().casefold()
 
 
-def _sentence_support(sentence: str, answer: Answer) -> float:
-    """Best content-term overlap between one sentence and the chunks it cites."""
+def _cited_contexts(sentence: str, answer: Answer) -> list[Scored]:
     markers = [int(marker) for marker in CITATION_RE.findall(sentence)]
-    contexts = [
+    return [
         answer.retrieved[marker - 1]
         for marker in markers
         if 1 <= marker <= len(answer.retrieved)
     ]
+
+
+def _sentence_support(sentence: str, answer: Answer) -> float:
+    """Best lexical overlap between one sentence and the chunks it cites."""
+    contexts = _cited_contexts(sentence, answer)
     if not contexts:
         return 0.0
-    sentence_terms = set(terms(CITATION_RE.sub(" ", sentence)))
-    if not sentence_terms:
-        return 0.0
-    return max(
-        len(sentence_terms & set(terms(hit.chunk.text))) / len(sentence_terms)
-        for hit in contexts
-    )
+    claim = CITATION_RE.sub(" ", sentence)
+    return LexicalJudge().score(claim, [hit.chunk.text for hit in contexts])
 
 
-def score_answer(answer: Answer, case: EvalCase) -> AnswerCaseScore:
-    """Grade one answer with citation and support proxies."""
+def score_answer(
+    answer: Answer, case: EvalCase, judge: Judge | None = None
+) -> AnswerCaseScore:
+    """Grade one answer with citation and support metrics.
+
+    ``judge`` defaults to the lexical proxy. Passing a model judge changes only
+    the support columns; citation precision/recall and expected-fact recall are
+    computed from labels and text, not from the judge.
+    """
+    judge = judge or LexicalJudge()
     sentences = _split_cited_sentences(answer.text)
     answered = bool(sentences) and REFUSAL_MARKER not in answer.text.casefold()
     if not answered:
@@ -266,8 +270,12 @@ def score_answer(answer: Answer, case: EvalCase) -> AnswerCaseScore:
         )
 
     grounded = sum(1 for sentence in sentences if CITATION_RE.search(sentence))
-    supports = [_sentence_support(sentence, answer) for sentence in sentences]
-    supported = sum(1 for value in supports if value >= SUPPORT_THRESHOLD)
+    supported = 0
+    for sentence in sentences:
+        contexts = _cited_contexts(sentence, answer)
+        claim = CITATION_RE.sub(" ", sentence).strip()
+        if contexts and judge.supports(claim, [hit.chunk.text for hit in contexts]):
+            supported += 1
 
     relevant = set(case.relevant_docs)
     cited = {citation.doc_id for citation in answer.citations}
@@ -301,9 +309,11 @@ def run_answer_eval(
     mode: str = "auto",
     rerank: bool = False,
     name: str | None = None,
+    judge: Judge | None = None,
 ) -> AnswerResult:
     """Run the answer pipeline over the golden set and aggregate its checks."""
     provider = provider or get_provider()
+    judge = judge or LexicalJudge()
     resolved_mode = index.resolve_mode(mode)
     scores = [
         score_answer(
@@ -316,6 +326,7 @@ def run_answer_eval(
                 rerank=rerank,
             ),
             case,
+            judge=judge,
         )
         for case in cases
     ]
@@ -339,6 +350,7 @@ def run_answer_eval(
         fact_recall=(sum(fact_scores) / len(fact_scores)) if fact_scores else 0.0,
         fact_cases=len(fact_scores),
         cases=scores,
+        judge=judge.name,
     )
 
 
@@ -346,7 +358,8 @@ def render_answer_markdown(results: Sequence[AnswerResult]) -> str:
     """Answer-quality table. Kept separate from retrieval metrics on purpose."""
     header = (
         "| Configuration | Answered | Grounded | Citation P | Citation R | "
-        "Lexical support | Unsupported | Expected facts |"
+        f"{'Lexical support' if not results or results[0].judge == 'lexical' else 'Model support'} "
+        "| Unsupported | Expected facts |"
     )
     divider = "|---|---:|---:|---:|---:|---:|---:|---:|"
     lines = [header, divider]
@@ -362,15 +375,23 @@ def render_answer_markdown(results: Sequence[AnswerResult]) -> str:
         lines.append("")
         lines.append(
             f"k = {first.k}, {len(first.cases)} queries, provider = {first.provider}, "
-            f"mode = {first.mode}. Expected-fact recall is averaged over "
-            f"{first.fact_cases} questions that declare `expects:`."
+            f"mode = {first.mode}, support judge = {first.judge}. Expected-fact recall "
+            f"is averaged over {first.fact_cases} questions that declare `expects:`."
         )
-        lines.append(
-            "Lexical support is a proxy: a sentence counts as supported when at least "
-            f"{SUPPORT_THRESHOLD:.0%} of its content terms appear in the chunk it cites. "
-            "It catches unsupported or mis-cited sentences, not every form of "
-            "hallucination; see the README's limitations."
-        )
+        if first.judge == "lexical":
+            lines.append(
+                "Lexical support is a proxy: a sentence counts as supported when at least "
+                f"{SUPPORT_THRESHOLD:.0%} of its content terms appear in the chunk it cites. "
+                "It catches unsupported or mis-cited sentences, not every form of "
+                "hallucination; see the README's limitations."
+            )
+        else:
+            lines.append(
+                f"Support was judged by `{first.judge}`, a model with its own errors and "
+                "cost. A model judgement is not ground truth and is not reproducible "
+                "across model versions; compare it with the lexical column before "
+                "trusting a change."
+            )
     return "\n".join(lines)
 
 

@@ -32,6 +32,8 @@ def client(monkeypatch, tmp_path):
         collections_dir=tmp_path / "collections",
         usage_db_path=tmp_path / "usage.db",
         rate_limit_per_minute=0,
+        rate_limit_backend="memory",
+        rate_limit_db_path=tmp_path / "rate-limit.db",
     )
     api_module.state.limiter = None
     api_module.state.usage = None
