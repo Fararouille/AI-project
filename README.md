@@ -17,7 +17,7 @@ No API keys. No network. No GPU. The default embedder is a deterministic feature
 model, so the benchmark is reproducible on any laptop. Swapping in a hosted embedding
 model and an LLM is one environment variable.
 
-![cite UI: an answer with inline citations, clickable sources, and the live benchmark panel](docs/screenshot.png)
+![cite UI: an answer with inline citations, clickable sources, the live benchmark panel, and the admin-only upload control](docs/screenshot.png)
 
 ---
 
@@ -320,11 +320,21 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 
+# one-time UI build; frontend/dist is gitignored
+cd frontend
+npm install
+npm run build
+cd ..
+
 cite ingest --corpus data/corpus          # 14 docs → 104 chunks in data/index.sqlite3
 cite ask "How many tiles can a dashboard have?"
 cite eval                                  # retrieval ablations + answer checks
 cite serve                                 # API + UI on http://127.0.0.1:8000
 ```
+
+The CLI needs no Node. `cite serve` only serves the UI when `frontend/dist` exists;
+without it, `/` returns JSON naming the build command instead of a page. Add `--reload`
+while working on the API: routes reload from disk, static files do not need it.
 
 `dev` includes the test tools and every loader. A runtime install can use
 `pip install -e ".[loaders]"` for HTML/PDF and `pip install -e ".[ocr]"` plus the
@@ -421,6 +431,24 @@ curl -s -X DELETE localhost:8000/api/documents/widgets
 With a semantic embedder, re-ingest using the same embedder (`--embedder openai`) so the
 indexed chunks and the incoming query are embedded in the same space. Changing the
 embedder deliberately invalidates the manifest and triggers a full rebuild.
+
+### The KEY box and the role badge
+
+The header's **KEY** field sends `X-API-Key` and is stored in this browser only. It exists
+for servers started with `CITE_API_KEYS`; when auth is off there is nothing to type.
+
+The badge beside it is the role `/api/me` reports:
+
+| badge | meaning |
+|---|---|
+| `ADMIN` | ask, upload, delete, and reindex are allowed |
+| `READER` | can ask and read granted collections; uploads stay disabled |
+| `KEY REQUIRED` | auth is on and no valid key was sent |
+| `…` | `/api/me` has not answered — usually an older server process |
+
+`add file` stays visible so the state is legible, but it is disabled unless the badge says
+`ADMIN`; hovering explains why. Entering an admin key re-fetches sources and clears the
+stale error banner.
 
 ---
 
@@ -528,6 +556,24 @@ extraction, OCR failure modes, upload validation, title and BOM handling, and tr
 manifest reuse and invalidation, JSON and SQLite round trips, per-document store patches,
 auth roles and ACLs, both rate-limit backends, usage aggregation, judge selection, document
 scoping, collection scoping, and the HTTP contract.
+
+## Troubleshooting
+
+Almost every "the UI is broken" report has one of three causes: the browser is pointed at a
+dead port, the running Python process predates the current code, or `frontend/dist` is
+missing. Static files are read from disk on every request, so a rebuilt UI needs only a
+hard refresh (`Ctrl+F5`); **routes and configuration need a restart.**
+
+| symptom | cause | fix |
+|---|---|---|
+| `URL can't be reached` | nothing listens on that port, or a test server was stopped | `Get-NetTCPConnection -LocalPort 8000 -State Listen` (macOS/Linux: `lsof -i :8000`), then `cite serve --port 8000` |
+| badge `…`, no `add file`, `/api/me` returns `404` | the process started before `/api/me` existed | stop it and restart `cite serve`; a page reload is not enough |
+| `KEY REQUIRED` or `missing API key` | the shell that started the server has `CITE_API_KEYS` set | enter a key from that list, or unset `CITE_API_KEYS`/`CITE_ADMIN_KEYS`/`CITE_KEY_ACLS` and restart |
+| `add file` disabled with badge `READER` | the key is valid but absent from `CITE_ADMIN_KEYS` | use an admin key |
+| `/` returns `{"hint":"frontend not built..."}` | `frontend/dist` is gitignored and missing | in `frontend/`: `npm install`, then `npm run build` |
+| still the old UI after `git pull` | the cached bundle | rebuild, then hard-refresh |
+| `POST /api/documents` fails on multipart | an old install or image without `python-multipart` | `pip install -e ".[dev]"` or rebuild the Docker image |
+| answers cite the corpus, not the upload | the browser tab is scoped to that document | click the document again to clear the scope |
 
 ## Deployment
 

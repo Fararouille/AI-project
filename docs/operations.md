@@ -226,7 +226,9 @@ curl -s -X DELETE localhost:8000/api/documents/widgets -H "X-API-Key: $ADMIN"
 Properties:
 
 - **Admin-only.** Upload and delete use the same role check as `/api/reindex`. With
-  `CITE_API_KEYS` empty, the local caller is an admin.
+  `CITE_API_KEYS` empty, the local caller is an admin. The UI asks `/api/me` for the role
+  and keeps **add file** visible but disabled for anyone else, so a missing button is a
+  permission state rather than a rendering bug.
 - **Outside the corpus.** Files are written to `CITE_UPLOADS_DIR/<collection>/`
   (`data/uploads/default/` by default), never to `CITE_CORPUS_DIR`. Extracted text is what
   gets indexed; the original file stays on disk for later rebuilds.
@@ -293,3 +295,36 @@ These are the honest gaps before calling this multi-tenant production software:
    manual.
 7. **OCR coverage.** OCR quality depends on scan quality and installed language data; it
    is not a document-layout parser and is slow for large scan sets.
+
+## 11. Running and troubleshooting the UI
+
+`cite serve` serves `frontend/dist`, which is gitignored, so a fresh clone needs one build:
+
+```bash
+cd frontend
+npm install
+npm run build
+cd ..
+cite serve                        # http://127.0.0.1:8000
+cite serve --port 8000 --reload   # API reload; static files are read per request anyway
+```
+
+The header's **KEY** field sends `X-API-Key` and is stored in the browser only. The badge
+next to it is the role from `/api/me`: `ADMIN` (upload/delete/reindex allowed), `READER`
+(ask and granted collections only), `KEY REQUIRED` (auth on, no valid key), or `…`
+(`/api/me` did not answer). `add file` is rendered but disabled unless the role is admin,
+so a missing button now reads as a permission state rather than a broken page.
+
+| symptom | cause | fix |
+|---|---|---|
+| `URL can't be reached` | no listener on that port, or a test server was stopped | check `Get-NetTCPConnection -LocalPort 8000 -State Listen` / `lsof -i :8000`; start `cite serve` |
+| badge `…`, `/api/me` is `404` | the process predates `/api/me` | restart `cite serve`; reloading the page will not add routes |
+| `missing API key` in the UI | this shell exported `CITE_API_KEYS` | enter a key from that list, or unset `CITE_API_KEYS`, `CITE_ADMIN_KEYS`, and `CITE_KEY_ACLS` and restart |
+| `add file` disabled with `READER` | key is valid but not in `CITE_ADMIN_KEYS` | use an admin key or add it deliberately |
+| `/` returns `{"hint":"frontend not built..."}` | `frontend/dist` missing | `npm install && npm run build` in `frontend/` |
+| stale UI after `git pull` | cached bundle | rebuild, then hard-refresh |
+| `POST /api/documents` errors on multipart | install or image without `python-multipart` | reinstall the package or rebuild the image |
+
+Diagnosis order: `/api/health` (is anything there?), `/api/me` (is the process current and
+what role?), then the role badge. Static assets update on refresh; Python routes and
+environment variables only update on restart.
