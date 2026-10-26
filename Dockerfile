@@ -18,9 +18,9 @@ WORKDIR /app
 
 COPY pyproject.toml README.md ./
 COPY src ./src
-COPY data ./data
+COPY data/corpus ./data/corpus
 COPY eval ./eval
-RUN pip install .
+RUN pip install ".[loaders]"
 
 COPY --from=ui /ui/dist ./frontend/dist
 

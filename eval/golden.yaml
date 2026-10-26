@@ -14,138 +14,172 @@ cases:
   - id: batch-size
     question: How many events can I send in a single request?
     relevant: [events-api]
+    expects: ["500 events"]
 
   - id: payload-limit
     question: What is the maximum payload size for an ingestion batch?
     relevant: [events-api]
+    expects: ["1 MB"]
     note: paraphrase of batch-size; no shared keywords with "500 events"
 
   - id: throttled
     question: How do I stop my integration from getting throttled?
     relevant: [rate-limits]
+    expects: ["Retry-After"]
     note: paraphrase; "throttled" never appears in the corpus
 
   - id: rate-limit-response
     question: What happens when I exceed the rate limit?
     relevant: [rate-limits]
+    expects: ["429"]
 
   - id: retention-free
     question: How long are events kept on the free plan?
     relevant: [overview, billing]
+    expects: ["30 days"]
 
   - id: key-rotation
     question: How do I rotate an API key without downtime?
     relevant: [authentication]
+    expects: ["24-hour grace period"]
 
   - id: missing-events
     question: Why do my events return 202 but never show up on the dashboard?
     relevant: [troubleshooting, quickstart]
+    expects: ["two minutes"]
 
   - id: funnel-steps
     question: What is the maximum number of steps in a funnel?
     relevant: [funnels]
+    expects: ["2 to 10"]
 
   - id: funnel-window
     question: What is the default conversion window for a funnel?
     relevant: [funnels]
+    expects: ["7-day"]
 
   - id: overage-pricing
     question: How much does event overage cost on the Growth plan?
     relevant: [billing]
+    expects: ["$0.12"]
 
   - id: webhook-signature
     question: How do I verify that a webhook came from Northwind?
     relevant: [webhooks]
+    expects: ["X-Northwind-Signature", "HMAC-SHA256"]
 
   - id: webhook-retries
     question: What retry schedule do failed webhook deliveries use?
     relevant: [webhooks]
+    expects: ["1 minute", "6 hours"]
 
   - id: cohort-refresh
     question: How often are dynamic cohorts recalculated?
     relevant: [cohorts]
+    expects: ["6 hours"]
 
   - id: export-s3
     question: How do I export events to my own S3 bucket?
     relevant: [data-export]
+    expects: ["Amazon S3"]
 
   - id: backfill
     question: Can I backfill events older than 30 days?
     relevant: [events-api]
+    expects: ["30 days"]
 
   - id: anomaly-alerts
     question: How does anomaly detection decide that a metric is unusual?
     relevant: [alerts]
+    expects: ["z-score"]
 
   - id: limit-vs-quota
     question: What is the difference between a rate limit and a quota?
     relevant: [rate-limits]
+    expects: ["per-minute", "per-month"]
 
   - id: sso-setup
     question: How do I set up SAML single sign-on with Okta?
     relevant: [sso]
+    expects: ["SAML 2.0"]
 
   - id: seat-billing
     question: Are viewers billed as seats?
     relevant: [billing]
+    expects: ["Viewers count as seats"]
 
   - id: numbers-changed
     question: My numbers keep changing for past dates, is that a bug?
     relevant: [troubleshooting, funnels]
+    expects: ["inserted by timestamp"]
     note: paraphrase-heavy; tests whether hybrid beats pure lexical
 
   - id: timezone
     question: What timezone are timestamps stored in?
     relevant: [troubleshooting]
+    expects: ["UTC"]
 
   - id: tile-limit
     question: How many tiles can a dashboard have?
     relevant: [dashboards]
+    expects: ["50 tiles"]
 
   - id: duplicate-events
     question: How do I prevent duplicate events when a request is retried?
     relevant: [events-api, troubleshooting]
+    expects: ["idempotency key"]
 
   - id: key-scopes
     question: What scopes can an API key have?
     relevant: [authentication]
+    expects: ["exactly one scope"]
 
   - id: free-quota
     question: What happens if I exceed the monthly event quota on the Free plan?
     relevant: [billing, rate-limits]
+    expects: ["402 Payment Required"]
 
   - id: anomaly-history
     question: How many days of history do anomaly alerts need before they work?
     relevant: [alerts]
+    expects: ["14 days"]
 
   - id: export-dedup
     question: How should I deduplicate exported Parquet files?
     relevant: [data-export]
+    expects: ["event_id"]
 
   - id: cohort-size
     question: What is the maximum size of a cohort?
     relevant: [cohorts]
+    expects: ["1,000,000 members"]
 
   - id: embed-dashboard
     question: How do I embed a dashboard in another website?
     relevant: [dashboards]
+    expects: ["iframe"]
 
   - id: sso-api-keys
     question: Does enforcing SSO affect API keys?
     relevant: [sso]
+    expects: ["API keys are unaffected"]
 
   - id: webhook-downtime
     question: What happens if my webhook endpoint is down for a whole day?
     relevant: [webhooks]
+    expects: ["dead"]
 
   - id: dashboard-cost
     question: How do I make dashboard queries cheaper and faster?
     relevant: [dashboards]
+    expects: ["break down"]
 
   - id: rejected-events
     question: Where can I see which events in a batch were rejected?
     relevant: [events-api]
+    expects: ["GET /v2/events/rejections"]
 
   - id: scim
     question: How does SCIM group mapping assign roles?
     relevant: [sso]
+    expects: ["Group push"]

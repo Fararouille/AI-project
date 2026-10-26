@@ -86,10 +86,30 @@ class BM25Index:
 class DenseIndex:
     """Cosine similarity over pre-normalised vectors: a dot product is enough."""
 
-    def __init__(self, chunks: Sequence[Chunk], embedder: Embedder | None = None) -> None:
+    def __init__(
+        self,
+        chunks: Sequence[Chunk],
+        embedder: Embedder | None = None,
+        vectors: Sequence[Sequence[float]] | None = None,
+    ) -> None:
         self.chunks = list(chunks)
         self.embedder = embedder or get_embedder()
-        self._vectors = self.embedder.embed([c.text for c in self.chunks]) if self.chunks else []
+        if vectors is None:
+            self.vectors = (
+                self.embedder.embed([c.text for c in self.chunks]) if self.chunks else []
+            )
+        else:
+            if len(vectors) != len(self.chunks):
+                raise ValueError(
+                    f"expected {len(self.chunks)} vectors, got {len(vectors)}"
+                )
+            for vector in vectors:
+                if len(vector) != self.embedder.dim:
+                    raise ValueError(
+                        f"vector width {len(vector)} does not match embedder dim "
+                        f"{self.embedder.dim}"
+                    )
+            self.vectors = [list(vector) for vector in vectors]
 
     def search(self, query: str, k: int = 10) -> list[Scored]:
         if not self.chunks:
@@ -97,13 +117,14 @@ class DenseIndex:
         query_vector = self.embedder.embed([query])[0]
         scored = [
             (position, sum(a * b for a, b in zip(query_vector, vector, strict=False)))
-            for position, vector in enumerate(self._vectors)
+            for position, vector in enumerate(self.vectors)
         ]
         scored.sort(key=lambda item: item[1], reverse=True)
         return [
             Scored(chunk=self.chunks[position], score=score, rank=rank)
             for rank, (position, score) in enumerate(scored[:k], start=1)
         ]
+
 
 
 def reciprocal_rank_fusion(
@@ -176,18 +197,45 @@ class HeuristicReranker:
 class Index:
     """Facade over the retrievers, with persistence and a single ``search`` entry point."""
 
-    def __init__(self, chunks: Sequence[Chunk], embedder: Embedder | None = None) -> None:
+    def __init__(
+        self,
+        chunks: Sequence[Chunk],
+        embedder: Embedder | None = None,
+        vectors: Sequence[Sequence[float]] | None = None,
+        manifest: dict | None = None,
+        chunking: dict | None = None,
+        stored_embedder: tuple[str, int] | None = None,
+    ) -> None:
         self.chunks = list(chunks)
         self.embedder = embedder or get_embedder()
         self.bm25 = BM25Index(self.chunks)
-        self._dense: DenseIndex | None = None
+        self._dense: DenseIndex | None = (
+            DenseIndex(self.chunks, self.embedder, vectors) if vectors is not None else None
+        )
         self.reranker = HeuristicReranker()
+        # Ingestion metadata. Kept on the index so a rebuild can ask "what did I
+        # already embed?" without a second sidecar file that can drift.
+        self.manifest = manifest or {}
+        self.chunking = chunking or {}
+        self.stored_embedder = stored_embedder or (self.embedder.name, self.embedder.dim)
+        self._positions = {chunk.chunk_id: i for i, chunk in enumerate(self.chunks)}
+        self.stats = None
 
     @property
     def dense(self) -> DenseIndex:
         if self._dense is None:
             self._dense = DenseIndex(self.chunks, self.embedder)
         return self._dense
+
+    def ensure_vectors(self) -> None:
+        """Force vector computation so a save/load round trip keeps them."""
+        _ = self.dense.vectors
+
+    def vector_for(self, chunk_id: str) -> list[float] | None:
+        position = self._positions.get(chunk_id)
+        if position is None:
+            return None
+        return self.dense.vectors[position]
 
     def resolve_mode(self, mode: str) -> str:
         """Resolve ``auto`` to the retriever the current embedder supports.
@@ -238,10 +286,13 @@ class Index:
 
     # -- persistence -------------------------------------------------------
     def to_dict(self) -> dict:
+        self.ensure_vectors()
         return {
-            "version": 1,
+            "version": 2,
             "embedder": self.embedder.name,
             "dim": self.embedder.dim,
+            "chunking": self.chunking,
+            "manifest": self.manifest,
             "chunks": [
                 {
                     "chunk_id": c.chunk_id,
@@ -254,6 +305,11 @@ class Index:
                     "source": c.source,
                 }
                 for c in self.chunks
+            ],
+            # Persisting vectors is what makes incremental re-indexing possible:
+            # an unchanged document costs zero embedder calls on the next run.
+            "vectors": [
+                [round(value, 6) for value in vector] for vector in self.dense.vectors
             ],
         }
 
@@ -272,7 +328,27 @@ class Index:
             )
             for item in payload.get("chunks", [])
         ]
-        return cls(chunks, embedder)
+        resolved = embedder or get_embedder()
+        vectors = payload.get("vectors")
+        if vectors is not None:
+            if len(vectors) != len(chunks) or any(
+                len(vector) != resolved.dim for vector in vectors
+            ):
+                # A stale or truncated vector block must not silently shift rows.
+                vectors = None
+        stored = payload.get("embedder")
+        stored_embedder = (
+            (str(stored), int(payload.get("dim", resolved.dim))) if stored else None
+        )
+        return cls(
+            chunks,
+            resolved,
+            vectors=vectors,
+            manifest=payload.get("manifest") or {},
+            chunking=payload.get("chunking") or {},
+            stored_embedder=stored_embedder,
+        )
+
 
 
 def normalize_scores(hits: Sequence[Scored]) -> list[Scored]:

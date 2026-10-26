@@ -82,12 +82,17 @@ class Answer:
 
 @dataclass(frozen=True, slots=True)
 class EvalCase:
-    """One graded query in the golden set."""
+    """One graded query in the golden set.
+
+    ``expects`` holds short strings that a correct answer must contain. They are
+    not a full reference answer; they are the facts a reviewer would check first.
+    """
 
     case_id: str
     question: str
     relevant_docs: tuple[str, ...]
     note: str = ""
+    expects: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,3 +118,37 @@ class ConfigResult:
     latency_p50_ms: float
     latency_p95_ms: float
     cases: list[CaseScore] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerCaseScore:
+    """Per-question answer quality, measured against the same golden set."""
+
+    case_id: str
+    answered: bool
+    grounded_rate: float
+    citation_precision: float
+    citation_recall: float
+    support_rate: float
+    unsupported_claim_rate: float
+    fact_recall: float
+
+
+@dataclass(slots=True)
+class AnswerResult:
+    """Aggregated answer-level metrics for one provider/retrieval configuration."""
+
+    name: str
+    provider: str
+    mode: str
+    reranked: bool
+    k: int
+    answered_rate: float
+    grounded_rate: float
+    citation_precision: float
+    citation_recall: float
+    support_rate: float
+    unsupported_claim_rate: float
+    fact_recall: float
+    fact_cases: int
+    cases: list[AnswerCaseScore] = field(default_factory=list)

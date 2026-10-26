@@ -15,6 +15,7 @@ user cares whether the right page was found, not which slice of it.
 from __future__ import annotations
 
 import math
+import re
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -22,10 +23,27 @@ from pathlib import Path
 
 import yaml
 
-from .models import CaseScore, ConfigResult, EvalCase, Scored
+from .answer import answer_question
+from .models import (
+    Answer,
+    AnswerCaseScore,
+    AnswerResult,
+    CaseScore,
+    ConfigResult,
+    EvalCase,
+    Scored,
+)
+from .providers import Provider, get_provider
 from .retrieval import Index
+from .text import terms
 
 DEFAULT_K = 5
+CITATION_RE = re.compile(r"\[(\d{1,2})\]")
+# A cited sentence counts as supported when at least this share of its content
+# terms appear in the cited chunk. This is a lexical proxy for entailment.
+SUPPORT_THRESHOLD = 0.60
+REFUSAL_MARKER = "could not find"
+
 
 DEFAULT_CONFIGS: tuple[tuple[str, str, bool], ...] = (
     ("BM25 only", "bm25", False),
@@ -61,6 +79,7 @@ def load_golden(path: str | Path) -> GoldenSet:
                 question=str(item["question"]).strip(),
                 relevant_docs=tuple(str(doc) for doc in relevant),
                 note=str(item.get("note", "")),
+                expects=tuple(str(fact) for fact in item.get("expects", [])),
             )
         )
     return GoldenSet(cases=tuple(cases), k=int(payload.get("k", DEFAULT_K)))
@@ -178,24 +197,197 @@ def render_markdown(results: Sequence[ConfigResult], embedder_name: str = "") ->
     return "\n".join(lines)
 
 
+def _split_cited_sentences(text: str) -> list[str]:
+    """Split an answer into sentences while keeping citation markers attached.
+
+    ``"Claim one. [1] Claim two. [2]"`` is the format both the mock and the hosted
+    prompt produce. A naive split at ``". "`` would start the next sentence with
+    ``[1]`` and report the first claim as ungrounded. Peeking one token ahead
+    fixes that without special-casing the provider.
+    """
+    tokens = text.split()
+    sentences: list[str] = []
+    current: list[str] = []
+    position = 0
+    while position < len(tokens):
+        token = tokens[position]
+        current.append(token)
+        if re.search(r"[.!?][\"')\]]*$", token):
+            while position + 1 < len(tokens) and re.fullmatch(
+                r"(?:\[\d{1,2}\])+", tokens[position + 1]
+            ):
+                position += 1
+                current.append(tokens[position])
+            sentences.append(" ".join(current))
+            current = []
+        position += 1
+    if current:
+        sentences.append(" ".join(current))
+    return [sentence for sentence in sentences if sentence.strip()]
+
+
+def _normalized(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip().casefold()
+
+
+def _sentence_support(sentence: str, answer: Answer) -> float:
+    """Best content-term overlap between one sentence and the chunks it cites."""
+    markers = [int(marker) for marker in CITATION_RE.findall(sentence)]
+    contexts = [
+        answer.retrieved[marker - 1]
+        for marker in markers
+        if 1 <= marker <= len(answer.retrieved)
+    ]
+    if not contexts:
+        return 0.0
+    sentence_terms = set(terms(CITATION_RE.sub(" ", sentence)))
+    if not sentence_terms:
+        return 0.0
+    return max(
+        len(sentence_terms & set(terms(hit.chunk.text))) / len(sentence_terms)
+        for hit in contexts
+    )
+
+
+def score_answer(answer: Answer, case: EvalCase) -> AnswerCaseScore:
+    """Grade one answer with citation and support proxies."""
+    sentences = _split_cited_sentences(answer.text)
+    answered = bool(sentences) and REFUSAL_MARKER not in answer.text.casefold()
+    if not answered:
+        return AnswerCaseScore(
+            case_id=case.case_id,
+            answered=False,
+            grounded_rate=0.0,
+            citation_precision=0.0,
+            citation_recall=0.0,
+            support_rate=0.0,
+            unsupported_claim_rate=0.0,
+            fact_recall=0.0,
+        )
+
+    grounded = sum(1 for sentence in sentences if CITATION_RE.search(sentence))
+    supports = [_sentence_support(sentence, answer) for sentence in sentences]
+    supported = sum(1 for value in supports if value >= SUPPORT_THRESHOLD)
+
+    relevant = set(case.relevant_docs)
+    cited = {citation.doc_id for citation in answer.citations}
+    precision = len(cited & relevant) / len(cited) if cited else 0.0
+    recall = len(cited & relevant) / len(relevant) if relevant else 0.0
+
+    if case.expects:
+        haystack = _normalized(answer.text)
+        matched = sum(1 for fact in case.expects if _normalized(fact) in haystack)
+        fact_recall = matched / len(case.expects)
+    else:
+        fact_recall = 0.0
+
+    return AnswerCaseScore(
+        case_id=case.case_id,
+        answered=True,
+        grounded_rate=grounded / len(sentences),
+        citation_precision=precision,
+        citation_recall=recall,
+        support_rate=supported / len(sentences),
+        unsupported_claim_rate=1.0 - supported / len(sentences),
+        fact_recall=fact_recall,
+    )
+
+
+def run_answer_eval(
+    index: Index,
+    cases: Sequence[EvalCase],
+    provider: Provider | None = None,
+    k: int = DEFAULT_K,
+    mode: str = "auto",
+    rerank: bool = False,
+    name: str | None = None,
+) -> AnswerResult:
+    """Run the answer pipeline over the golden set and aggregate its checks."""
+    provider = provider or get_provider()
+    resolved_mode = index.resolve_mode(mode)
+    scores = [
+        score_answer(
+            answer_question(
+                index,
+                case.question,
+                provider=provider,
+                k=k,
+                mode=resolved_mode,
+                rerank=rerank,
+            ),
+            case,
+        )
+        for case in cases
+    ]
+
+    count = len(scores)
+    fact_scores = [
+        score.fact_recall for score, case in zip(scores, cases, strict=True) if case.expects
+    ]
+    return AnswerResult(
+        name=name or f"{provider.name} provider",
+        provider=provider.name,
+        mode=resolved_mode,
+        reranked=rerank,
+        k=k,
+        answered_rate=sum(score.answered for score in scores) / count,
+        grounded_rate=sum(score.grounded_rate for score in scores) / count,
+        citation_precision=sum(score.citation_precision for score in scores) / count,
+        citation_recall=sum(score.citation_recall for score in scores) / count,
+        support_rate=sum(score.support_rate for score in scores) / count,
+        unsupported_claim_rate=sum(score.unsupported_claim_rate for score in scores) / count,
+        fact_recall=(sum(fact_scores) / len(fact_scores)) if fact_scores else 0.0,
+        fact_cases=len(fact_scores),
+        cases=scores,
+    )
+
+
+def render_answer_markdown(results: Sequence[AnswerResult]) -> str:
+    """Answer-quality table. Kept separate from retrieval metrics on purpose."""
+    header = (
+        "| Configuration | Answered | Grounded | Citation P | Citation R | "
+        "Lexical support | Unsupported | Expected facts |"
+    )
+    divider = "|---|---:|---:|---:|---:|---:|---:|---:|"
+    lines = [header, divider]
+    for result in results:
+        lines.append(
+            f"| {result.name} | {result.answered_rate:.3f} | {result.grounded_rate:.3f} | "
+            f"{result.citation_precision:.3f} | {result.citation_recall:.3f} | "
+            f"{result.support_rate:.3f} | {result.unsupported_claim_rate:.3f} | "
+            f"{result.fact_recall:.3f} |"
+        )
+    if results:
+        first = results[0]
+        lines.append("")
+        lines.append(
+            f"k = {first.k}, {len(first.cases)} queries, provider = {first.provider}, "
+            f"mode = {first.mode}. Expected-fact recall is averaged over "
+            f"{first.fact_cases} questions that declare `expects:`."
+        )
+        lines.append(
+            "Lexical support is a proxy: a sentence counts as supported when at least "
+            f"{SUPPORT_THRESHOLD:.0%} of its content terms appear in the chunk it cites. "
+            "It catches unsupported or mis-cited sentences, not every form of "
+            "hallucination; see the README's limitations."
+        )
+    return "\n".join(lines)
+
+
 def answer_metrics(
     text: str, citations: Sequence, relevant_docs: Sequence[str]
 ) -> dict[str, float]:
-    """Heuristic answer-level checks. Labeled heuristic because they are, not because they're weak.
+    """Heuristic answer-level checks that only need text and citations.
 
-    ``grounded_rate`` asks how many answer sentences carry at least one citation.
-    ``citation_precision`` asks how many citations point at a document a human
-    marked relevant. Both are proxies for faithfulness; neither replaces a human
-    review, and the README says so.
+    Kept as a small public helper for callers that do not have the retrieved
+    chunks. :func:`score_answer` is the fuller version used by the harness.
     """
-    from .text import split_sentences
-
-    sentences = [s for s in split_sentences(text) if s]
-    grounded = sum(1 for s in sentences if "[" in s and "]" in s)
+    sentences = _split_cited_sentences(text)
+    grounded = sum(1 for sentence in sentences if CITATION_RE.search(sentence))
     relevant = set(relevant_docs)
 
     if citations:
-        cited_docs = {c.doc_id for c in citations}
+        cited_docs = {citation.doc_id for citation in citations}
         precision = len(cited_docs & relevant) / len(cited_docs)
         recall = len(cited_docs & relevant) / len(relevant) if relevant else 0.0
     else:

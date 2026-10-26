@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cite import api as api_module
+from cite.config import Settings
 from cite.embeddings import HashingEmbedder
 from cite.models import Chunk
 from cite.retrieval import Index
@@ -23,9 +24,25 @@ def client(monkeypatch, tmp_path):
         )
     ]
     api_module.state.index = Index(chunks, HashingEmbedder(dim=64))
+    api_module.state.collections = {"default": api_module.state.index}
+    api_module.state.settings = Settings(
+        corpus_dir=tmp_path / "corpus",
+        index_path=tmp_path / "index.json",
+        golden_path=tmp_path / "golden.yaml",
+        collections_dir=tmp_path / "collections",
+        usage_db_path=tmp_path / "usage.db",
+        rate_limit_per_minute=0,
+    )
+    api_module.state.limiter = None
+    api_module.state.usage = None
     monkeypatch.setattr(api_module, "FRONTEND_DIR", tmp_path / "missing")
     yield TestClient(api_module.app)
+    if api_module.state.usage is not None:
+        api_module.state.usage.close()
     api_module.state.index = None
+    api_module.state.collections = {}
+    api_module.state.settings = None
+    api_module.state.usage = None
 
 
 def test_health_reports_loaded_index(client) -> None:
@@ -69,5 +86,6 @@ def test_stream_emits_tokens_then_done(client) -> None:
 
 def test_ask_returns_503_without_index(client) -> None:
     api_module.state.index = None
+    api_module.state.collections = {}
     response = client.post("/api/ask", json={"question": "anything"})
     assert response.status_code == 503

@@ -1,0 +1,28 @@
+# Keep the build context small and deterministic: the image builds its index
+# from data/corpus, never from a developer's generated index or usage log.
+.git
+.gitignore
+.venv
+venv
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+data/index.json
+data/collections/
+data/usage.db
+data/usage.db-*
+data/*.tmp
+
+frontend/node_modules/
+frontend/dist/
+
+tests/
+scripts/
+docs/
+.env
+.env.*

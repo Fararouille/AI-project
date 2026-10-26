@@ -11,6 +11,10 @@ dist/
 
 # Generated artefacts
 data/index.json
+data/collections/
+data/usage.db
+data/usage.db-wal
+data/usage.db-shm
 
 # Frontend
 frontend/node_modules/

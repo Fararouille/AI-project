@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Widget API Handbook</title>
+    <style>.hidden { display: none; }</style>
+    <script>window.tracking = "do-not-index-this";</script>
+  </head>
+  <body>
+    <nav><a href="/">Home</a><a href="/docs">Docs</a></nav>
+    <main>
+      <h1>Widget API</h1>
+      <p>Widgets are created with <code>POST /v1/widgets</code>. The response includes an id.</p>
+
+      <h2>Limits</h2>
+      <ul>
+        <li>Each account may create 250 widgets per day.</li>
+        <li>Widget names are limited to 80 characters.</li>
+      </ul>
+
+      <h2>Pricing</h2>
+      <table>
+        <tr><th>Plan</th><th>Price</th></tr>
+        <tr><td>Free</td><td>$0</td></tr>
+        <tr><td>Growth</td><td>$49</td></tr>
+      </table>
+
+      <h2>Example</h2>
+      <pre><code>{"name": "signup", "color": "blue"}</code></pre>
+    </main>
+    <aside>Related links that are not content.</aside>
+    <footer>Copyright 2026. Not part of the answer.</footer>
+  </body>
+</html>

@@ -1,21 +1,37 @@
 """HTTP API and web UI host.
 
-The index is loaded once at startup and held in a small lock-protected store. That
-is the right amount of infrastructure for a single-node document QA service; the
-README explains where it would need to change for multi-tenant use.
+The default deployment is one process holding a small map of collection indexes.
+That is the right amount of infrastructure for a single-node document QA service.
+The hardening here is deliberately bounded:
+
+* optional API keys (``CITE_API_KEYS``) on every endpoint that can spend money
+* an in-process token bucket per identity (``CITE_RATE_LIMIT_PER_MINUTE``)
+* a SQLite query log with an aggregate ``/api/usage`` endpoint
+* named collections stored as separate index files, so one corpus cannot leak
+  into another through a shared id space
+
+What is still missing for real multi-tenancy is listed in the README: per-tenant
+embedding budgets, a shared vector store, and a reindex queue.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
+import math
+import os
+import sqlite3
 import threading
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -23,10 +39,16 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .answer import answer_question
-from .config import Settings
-from .embeddings import get_embedder
-from .evaluation import load_golden, render_markdown, run_ablations
-from .ingest import build_index, load_index
+from .config import Settings, normalize_collection
+from .embeddings import Embedder, get_embedder
+from .evaluation import (
+    load_golden,
+    render_answer_markdown,
+    render_markdown,
+    run_ablations,
+    run_answer_eval,
+)
+from .ingest import build_index, load_index, save_index
 from .models import Answer, ConfigResult
 from .providers import get_provider
 from .retrieval import Index
@@ -34,41 +56,277 @@ from .retrieval import Index
 FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
 
+# --------------------------------------------------------------------------- rate limiting
+class TokenBucket:
+    __slots__ = ("capacity", "rate", "tokens", "updated")
+
+    def __init__(self, per_minute: int) -> None:
+        self.capacity = float(per_minute)
+        self.rate = per_minute / 60.0
+        self.tokens = float(per_minute)
+        self.updated = time.monotonic()
+
+    def consume(self, now: float) -> tuple[bool, float]:
+        elapsed = max(0.0, now - self.updated)
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+        self.updated = now
+        if self.tokens >= 1.0:
+            self.tokens -= 1.0
+            return True, 0.0
+        wait = (1.0 - self.tokens) / self.rate if self.rate else 0.0
+        return False, wait
+
+
+class RateLimiter:
+    """Per-identity token bucket. Memory-only on purpose: one process, no Redis."""
+
+    def __init__(self, per_minute: int) -> None:
+        self.per_minute = per_minute
+        self._buckets: dict[str, TokenBucket] = {}
+        self._lock = threading.Lock()
+
+    def consume(self, identity: str) -> tuple[bool, int]:
+        if self.per_minute <= 0:
+            return True, 0
+        now = time.monotonic()
+        with self._lock:
+            self._prune(now)
+            bucket = self._buckets.get(identity)
+            if bucket is None:
+                bucket = TokenBucket(self.per_minute)
+                self._buckets[identity] = bucket
+            allowed, wait = bucket.consume(now)
+        return allowed, max(0, math.ceil(wait))
+
+    def _prune(self, now: float) -> None:
+        if len(self._buckets) < 4096:
+            return
+        stale = [key for key, bucket in self._buckets.items() if now - bucket.updated > 3600]
+        for key in stale:
+            del self._buckets[key]
+
+
+# --------------------------------------------------------------------------- usage store
+class UsageStore:
+    """Append-only SQLite log. Aggregates are computed on read at this scale."""
+
+    def __init__(self, path: str | Path, log_questions: bool = False) -> None:
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        self.log_questions = log_questions
+        self._conn = sqlite3.connect(str(destination), check_same_thread=False, timeout=5.0)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS queries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                identity TEXT NOT NULL,
+                collection TEXT NOT NULL,
+                question_hash TEXT NOT NULL,
+                question TEXT,
+                question_chars INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                latency_ms REAL NOT NULL,
+                tokens_in INTEGER NOT NULL,
+                tokens_out INTEGER NOT NULL,
+                cost_usd REAL NOT NULL,
+                citations INTEGER NOT NULL
+            )
+            """
+        )
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_queries_ts ON queries(ts)")
+        self._conn.commit()
+        self._lock = threading.Lock()
+
+    def record(
+        self,
+        *,
+        identity: str,
+        collection: str,
+        question: str,
+        mode: str,
+        provider: str,
+        latency_ms: float,
+        tokens_in: int,
+        tokens_out: int,
+        cost_usd: float,
+        citations: int,
+    ) -> None:
+        digest = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
+        stored = question if self.log_questions else None
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO queries (
+                    ts, identity, collection, question_hash, question, question_chars,
+                    mode, provider, latency_ms, tokens_in, tokens_out, cost_usd, citations
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    time.time(),
+                    identity,
+                    collection,
+                    digest,
+                    stored,
+                    len(question),
+                    mode,
+                    provider,
+                    latency_ms,
+                    tokens_in,
+                    tokens_out,
+                    cost_usd,
+                    citations,
+                ),
+            )
+            self._conn.commit()
+
+    @staticmethod
+    def _percentile(values: list[float], fraction: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        position = min(len(ordered) - 1, max(0, math.ceil(fraction * len(ordered)) - 1))
+        return ordered[position]
+
+    def summary(self, hours: int = 24) -> dict:
+        cutoff = time.time() - max(1, hours) * 3600
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT ts, collection, mode, latency_ms, tokens_in, tokens_out,
+                       cost_usd, citations
+                FROM queries WHERE ts >= ? ORDER BY ts
+                """,
+                (cutoff,),
+            ).fetchall()
+
+        by_collection: dict[str, list[float]] = {}
+        by_mode: dict[str, int] = {}
+        for _, collection, mode, latency, *_ in rows:
+            by_collection.setdefault(collection, []).append(latency)
+            by_mode[mode] = by_mode.get(mode, 0) + 1
+
+        latencies = [row[3] for row in rows]
+        return {
+            "window_hours": hours,
+            "requests": len(rows),
+            "avg_latency_ms": round(sum(latencies) / len(latencies), 2) if latencies else 0.0,
+            "p95_latency_ms": round(self._percentile(latencies, 0.95), 2),
+            "tokens_in": sum(row[4] for row in rows),
+            "tokens_out": sum(row[5] for row in rows),
+            "cost_usd": round(sum(row[6] for row in rows), 6),
+            "citations": sum(row[7] for row in rows),
+            "by_collection": [
+                {
+                    "collection": name,
+                    "requests": len(values),
+                    "avg_latency_ms": round(sum(values) / len(values), 2),
+                }
+                for name, values in sorted(by_collection.items())
+            ],
+            "by_mode": [
+                {"mode": mode, "requests": count}
+                for mode, count in sorted(by_mode.items())
+            ],
+            "last_request_at": (
+                datetime.fromtimestamp(rows[-1][0], timezone.utc).isoformat()
+                if rows
+                else None
+            ),
+        }
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+
+# --------------------------------------------------------------------------- app state
 @dataclass
 class AppState:
     index: Index | None = None
+    collections: dict[str, Index] = field(default_factory=dict)
     last_eval: list[ConfigResult] | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
+    settings: Settings | None = None
+    limiter: RateLimiter | None = None
+    usage: UsageStore | None = None
+    default_collection: str = "default"
 
 
 state = AppState()
 
 
-def load_or_build_index() -> Index:
-    settings = Settings.from_env()
-    embedder = get_embedder()
-    if settings.index_path.exists():
-        return load_index(settings.index_path, embedder)
-    if settings.corpus_dir.exists():
-        index = build_index(settings.corpus_dir, embedder=embedder)
-        settings.index_path.parent.mkdir(parents=True, exist_ok=True)
-        from .ingest import save_index
+def _settings() -> Settings:
+    return state.settings or Settings.from_env()
 
+
+def _configured_embedder() -> Embedder | None:
+    explicit = os.getenv("CITE_EMBEDDER")
+    return get_embedder(explicit) if explicit else None
+
+
+def _collection(name: str | None) -> str:
+    settings = _settings()
+    try:
+        return normalize_collection(name, settings.default_collection)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def load_or_build_indexes() -> dict[str, Index]:
+    settings = _settings()
+    state.settings = settings
+    state.default_collection = settings.default_collection
+    indexes: dict[str, Index] = {}
+
+    if settings.index_path.exists():
+        indexes[settings.default_collection] = load_index(
+            settings.index_path, _configured_embedder()
+        )
+    elif settings.corpus_dir.exists():
+        index = build_index(
+            settings.corpus_dir,
+            embedder=_configured_embedder() or get_embedder(),
+            collection=settings.default_collection,
+        )
         save_index(index, settings.index_path)
-        return index
-    raise RuntimeError(
-        "no index found; run `cite ingest --corpus data/corpus` or set CITE_INDEX_PATH"
-    )
+        indexes[settings.default_collection] = index
+
+    if settings.collections_dir.exists():
+        for path in sorted(settings.collections_dir.glob("*.json")):
+            name = path.stem
+            if name in indexes:
+                continue
+            try:
+                indexes[name] = load_index(path, _configured_embedder())
+            except Exception as exc:  # one bad collection must not hide the rest
+                print(f"[cite] skipped collection {name!r}: {exc}")
+
+    state.collections = indexes
+    state.index = indexes.get(settings.default_collection)
+    return indexes
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    settings = _settings()
     try:
-        state.index = load_or_build_index()
+        load_or_build_indexes()
     except Exception as exc:  # surfaced through /api/health rather than crashing the server
         print(f"[cite] index not loaded: {exc}")
+    try:
+        state.usage = UsageStore(settings.usage_db_path, settings.log_questions)
+    except (sqlite3.Error, OSError) as exc:
+        print(f"[cite] usage log disabled: {exc}")
+        state.usage = None
     yield
+    if state.usage is not None:
+        state.usage.close()
+    state.usage = None
     state.index = None
+    state.collections = {}
 
 
 app = FastAPI(
@@ -85,12 +343,98 @@ app.add_middleware(
 )
 
 
+# --------------------------------------------------------------------------- auth
+def _presented_key(request: Request) -> str | None:
+    direct = request.headers.get("x-api-key")
+    if direct:
+        return direct.strip()
+    authorization = request.headers.get("authorization", "")
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return None
+
+
+def require_identity(request: Request) -> str:
+    """Authenticate (when configured) and apply the token bucket.
+
+    Auth is disabled when ``CITE_API_KEYS`` is empty, so the default offline
+    install keeps working. Rate limiting still applies by client IP in that mode.
+    """
+    settings = _settings()
+    key = _presented_key(request)
+    if settings.api_keys:
+        if not key:
+            raise HTTPException(
+                status_code=401,
+                detail="missing API key; send X-API-Key or Authorization: Bearer <key>",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if not any(
+            hmac.compare_digest(key.encode("utf-8"), candidate.encode("utf-8"))
+            for candidate in settings.api_keys
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="invalid API key",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        identity = "key:" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    else:
+        host = request.client.host if request.client else "unknown"
+        identity = f"ip:{host}"
+
+    if state.limiter is None or state.limiter.per_minute != settings.rate_limit_per_minute:
+        state.limiter = RateLimiter(settings.rate_limit_per_minute)
+    allowed, retry_after = state.limiter.consume(identity)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="rate limit exceeded",
+            headers={"Retry-After": str(retry_after)},
+        )
+    return identity
+
+
+def _usage_store(settings: Settings) -> UsageStore | None:
+    if state.usage is not None:
+        state.usage.log_questions = settings.log_questions
+        return state.usage
+    try:
+        state.usage = UsageStore(settings.usage_db_path, settings.log_questions)
+    except (sqlite3.Error, OSError) as exc:
+        print(f"[cite] usage log disabled: {exc}")
+        return None
+    return state.usage
+
+
+def _record(answer: Answer, collection: str, identity: str) -> None:
+    store = _usage_store(_settings())
+    if store is None:
+        return
+    try:
+        store.record(
+            identity=identity,
+            collection=collection,
+            question=answer.question,
+            mode=answer.retrieval_mode,
+            provider=answer.provider,
+            latency_ms=answer.latency_ms,
+            tokens_in=answer.tokens_in,
+            tokens_out=answer.tokens_out,
+            cost_usd=answer.cost_usd,
+            citations=len(answer.citations),
+        )
+    except (sqlite3.Error, OSError) as exc:  # telemetry must never break an answer
+        print(f"[cite] usage write failed: {exc}")
+
+
 # --------------------------------------------------------------------------- schemas
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     k: int = Field(default=5, ge=1, le=20)
     mode: Literal["auto", "bm25", "dense", "hybrid"] = "auto"
     rerank: bool = False
+    collection: str | None = None
 
 
 class CitationModel(BaseModel):
@@ -105,12 +449,20 @@ class CitationModel(BaseModel):
 class AskResponse(BaseModel):
     question: str
     answer: str
+    collection: str
     citations: list[CitationModel]
     latency_ms: float
     mode: str
     reranked: bool
     provider: str
     cost_usd: float
+
+
+class CollectionInfo(BaseModel):
+    name: str
+    documents: int
+    chunks: int
+    embedder: str
 
 
 class HealthResponse(BaseModel):
@@ -120,23 +472,49 @@ class HealthResponse(BaseModel):
     chunks: int
     embedder: str
     provider: str
+    collections: list[CollectionInfo]
+    auth_required: bool
+    rate_limit_per_minute: int
+
+
+class ReindexRequest(BaseModel):
+    collection: str | None = None
+    incremental: bool = True
 
 
 class ReindexResponse(BaseModel):
+    collection: str
     documents: int
     chunks: int
+    stats: dict
 
 
-def _require_index() -> Index:
-    if state.index is None:
+class UsageResponse(BaseModel):
+    auth_required: bool
+    summary: dict
+
+
+# --------------------------------------------------------------------------- helpers
+def _require_index(collection: str | None) -> tuple[str, Index]:
+    name = _collection(collection)
+    if name in state.collections:
+        return name, state.collections[name]
+    if state.index is not None and name == state.default_collection:
+        return name, state.index
+    if not state.collections and state.index is None and name == state.default_collection:
         raise HTTPException(status_code=503, detail="index not loaded; POST /api/reindex")
-    return state.index
+    available = sorted(state.collections) or [state.default_collection]
+    raise HTTPException(
+        status_code=404,
+        detail=f"collection {name!r} is not loaded; available: {', '.join(available)}",
+    )
 
 
-def _serialize(answer: Answer) -> AskResponse:
+def _serialize(answer: Answer, collection: str) -> AskResponse:
     return AskResponse(
         question=answer.question,
         answer=answer.text,
+        collection=collection,
         citations=[
             CitationModel(
                 marker=citation.marker,
@@ -159,25 +537,46 @@ def _serialize(answer: Answer) -> AskResponse:
 # --------------------------------------------------------------------------- routes
 @app.get("/api/health", response_model=HealthResponse)
 def health() -> HealthResponse:
-    index = state.index
+    settings = _settings()
+    default = state.index
+    collections = [
+        CollectionInfo(
+            name=name,
+            documents=len({chunk.doc_id for chunk in index.chunks}),
+            chunks=len(index),
+            embedder=index.embedder.name,
+        )
+        for name, index in sorted(state.collections.items())
+    ]
     return HealthResponse(
-        status="ok" if index is not None else "degraded",
+        status="ok" if default is not None else "degraded",
         version=__version__,
-        documents=len({chunk.doc_id for chunk in index.chunks}) if index else 0,
-        chunks=len(index) if index else 0,
-        embedder=index.embedder.name if index else "unavailable",
+        documents=len({chunk.doc_id for chunk in default.chunks}) if default else 0,
+        chunks=len(default) if default else 0,
+        embedder=default.embedder.name if default else "unavailable",
         provider=get_provider().name,
+        collections=collections,
+        auth_required=settings.auth_enabled,
+        rate_limit_per_minute=settings.rate_limit_per_minute,
     )
 
 
 @app.get("/api/sources")
-def sources() -> list[dict]:
-    index = _require_index()
+def sources(
+    collection: str | None = None, identity: str = Depends(require_identity)
+) -> list[dict]:
+    name, index = _require_index(collection)
     grouped: dict[str, dict] = {}
     for chunk in index.chunks:
         entry = grouped.setdefault(
             chunk.doc_id,
-            {"doc_id": chunk.doc_id, "title": chunk.doc_title, "chunks": 0, "headings": []},
+            {
+                "doc_id": chunk.doc_id,
+                "title": chunk.doc_title,
+                "collection": name,
+                "chunks": 0,
+                "headings": [],
+            },
         )
         entry["chunks"] += 1
         if chunk.heading and chunk.heading not in entry["headings"]:
@@ -186,8 +585,8 @@ def sources() -> list[dict]:
 
 
 @app.post("/api/ask", response_model=AskResponse)
-def ask(request: AskRequest) -> AskResponse:
-    index = _require_index()
+def ask(request: AskRequest, identity: str = Depends(require_identity)) -> AskResponse:
+    name, index = _require_index(request.collection)
     answer = answer_question(
         index,
         request.question,
@@ -196,12 +595,15 @@ def ask(request: AskRequest) -> AskResponse:
         mode=request.mode,
         rerank=request.rerank,
     )
-    return _serialize(answer)
+    _record(answer, name, identity)
+    return _serialize(answer, name)
 
 
 @app.post("/api/ask/stream")
-async def ask_stream(request: AskRequest) -> StreamingResponse:
-    index = _require_index()
+async def ask_stream(
+    request: AskRequest, identity: str = Depends(require_identity)
+) -> StreamingResponse:
+    name, index = _require_index(request.collection)
     answer = answer_question(
         index,
         request.question,
@@ -210,6 +612,7 @@ async def ask_stream(request: AskRequest) -> StreamingResponse:
         mode=request.mode,
         rerank=request.rerank,
     )
+    _record(answer, name, identity)
 
     async def events():
         # Tokens are chunked from a completed answer: the local provider is not a
@@ -218,16 +621,20 @@ async def ask_stream(request: AskRequest) -> StreamingResponse:
             payload = json.dumps({"delta": token + " "})
             yield f"event: token\ndata: {payload}\n\n"
             await asyncio.sleep(0.012)
-        payload = _serialize(answer).model_dump_json()
+        payload = _serialize(answer, name).model_dump_json()
         yield f"event: done\ndata: {payload}\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream")
 
 
 @app.post("/api/eval")
-def evaluate() -> dict:
-    index = _require_index()
-    settings = Settings.from_env()
+def evaluate(
+    answers: bool = False,
+    collection: str | None = None,
+    identity: str = Depends(require_identity),
+) -> dict:
+    _, index = _require_index(collection)
+    settings = _settings()
     try:
         golden = load_golden(settings.golden_path)
     except FileNotFoundError as exc:
@@ -236,7 +643,7 @@ def evaluate() -> dict:
     with state.lock:
         results = run_ablations(index, golden.cases, k=golden.k)
         state.last_eval = results
-    return {
+    payload = {
         "markdown": render_markdown(results, index.embedder.name),
         "queries": len(golden.cases),
         "results": [
@@ -251,19 +658,74 @@ def evaluate() -> dict:
             for item in results
         ],
     }
+    if answers:
+        answer_result = run_answer_eval(
+            index, golden.cases, provider=get_provider(), k=golden.k, mode="auto"
+        )
+        payload["answer_markdown"] = render_answer_markdown([answer_result])
+        payload["answers"] = {
+            "answered_rate": round(answer_result.answered_rate, 4),
+            "grounded_rate": round(answer_result.grounded_rate, 4),
+            "citation_precision": round(answer_result.citation_precision, 4),
+            "citation_recall": round(answer_result.citation_recall, 4),
+            "support_rate": round(answer_result.support_rate, 4),
+            "unsupported_claim_rate": round(answer_result.unsupported_claim_rate, 4),
+            "fact_recall": round(answer_result.fact_recall, 4),
+        }
+    return payload
 
 
 @app.post("/api/reindex", response_model=ReindexResponse)
-def reindex() -> ReindexResponse:
-    settings = Settings.from_env()
+def reindex(
+    request: ReindexRequest | None = None, identity: str = Depends(require_identity)
+) -> ReindexResponse:
+    settings = _settings()
+    options = request or ReindexRequest()
+    name = _collection(options.collection)
+    destination = settings.index_path_for(name)
+    embedder = _configured_embedder() or get_embedder()
+
+    previous = None
+    if options.incremental and destination.exists():
+        try:
+            previous = load_index(destination, embedder, require_match=False)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"[cite] previous index unusable ({exc}); rebuilding")
     try:
-        index = build_index(settings.corpus_dir, embedder=get_embedder())
+        index = build_index(
+            settings.corpus_dir,
+            embedder=embedder,
+            previous=previous,
+            incremental=options.incremental,
+            collection=name,
+        )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    save_index(index, destination)
     with state.lock:
-        state.index = index
+        state.collections[name] = index
+        if name == settings.default_collection:
+            state.index = index
     return ReindexResponse(
-        documents=len({chunk.doc_id for chunk in index.chunks}), chunks=len(index)
+        collection=name,
+        documents=len(index.manifest.get("documents", {})),
+        chunks=len(index),
+        stats=index.stats.as_dict() if index.stats else {},
+    )
+
+
+@app.get("/api/usage", response_model=UsageResponse)
+def usage(
+    hours: int = Query(default=24, ge=1, le=24 * 30),
+    identity: str = Depends(require_identity),
+) -> UsageResponse:
+    settings = _settings()
+    store = _usage_store(settings)
+    if store is None:
+        raise HTTPException(status_code=503, detail="usage log unavailable")
+    return UsageResponse(
+        auth_required=settings.auth_enabled,
+        summary=store.summary(hours=hours),
     )
 
 
@@ -274,6 +736,7 @@ if FRONTEND_DIR.exists():
     @app.get("/")
     def ui() -> FileResponse:
         return FileResponse(FRONTEND_DIR / "index.html")
+
 else:
 
     @app.get("/")
