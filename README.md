@@ -153,6 +153,38 @@ The provider interface is one method (`generate(question, contexts)`), so adding
 backend is a class, not a refactor. `mode=auto` switches to hybrid retrieval as soon as
 the embedder is semantic.
 
+### Using your own documents
+
+The demo answers from `data/corpus/` — 14 synthetic Markdown pages for a fictional
+product, written for this project. Point the ingester at any folder to replace them:
+
+```bash
+cite ingest --corpus "$HOME/handbook" --out data/index.json
+cite serve
+```
+
+- Supported files: `.md`, `.markdown`, `.txt`; subdirectories are walked recursively.
+- Document id is the filename slug; the title is the first `#` heading, falling back to
+  the filename.
+- Headings become the citation breadcrumb, and bullets, tables, and fenced code stay
+  intact as separately citable chunks.
+- `cite serve` loads the index at startup, so **restart it after re-ingesting**.
+
+`data/index.json` contains the text of every chunk, not just pointers — the answer is
+built from that text. Keep a private corpus and its index out of version control;
+`data/corpus/` is committed here only because it is synthetic.
+
+Paths can also be set without flags:
+
+| variable | default |
+| --- | --- |
+| `CITE_CORPUS_DIR` | `data/corpus` |
+| `CITE_INDEX_PATH` | `data/index.json` |
+| `CITE_GOLDEN_PATH` | `eval/golden.yaml` |
+
+With a semantic embedder, re-ingest using the same embedder (`--embedder openai`) so the
+indexed chunks and the incoming query are embedded in the same space.
+
 ---
 
 ## Design decisions, and their costs
@@ -204,7 +236,7 @@ tests/            49 tests: metrics, chunking, retrieval, citations, HTTP API
 ## Tests
 
 ```bash
-pytest            # 49 passed
+pytest            # 50 passed
 ruff check src tests
 ```
 
@@ -219,7 +251,9 @@ docker run -p 8000:8000 cite
 ```
 
 The image builds the frontend, indexes `data/corpus`, and serves API + UI from one port.
-CI (`.github/workflows/ci.yml`) runs lint, tests, and a benchmark regression check.
+Replace `data/corpus` before building to ship your own documents: the index is baked at
+build time, so container start-up needs no ingestion step. CI
+(`.github/workflows/ci.yml`) runs lint, tests, and a benchmark regression check.
 
 ---
 
