@@ -87,14 +87,22 @@ export default function App() {
   const abortRef = useRef<AbortController | null>(null);
 
   const refresh = useCallback(async () => {
+    // Health is public; load it separately so an unauthenticated /api/sources
+    // still leaves the header and role badge informative.
+    setError(null);
     try {
-      const [nextHealth, nextSources] = await Promise.all([getHealth(), getSources()]);
-      setHealth(nextHealth);
+      setHealth(await getHealth());
+    } catch (err) {
+      setError((err as Error).message);
+    }
+    try {
+      const nextSources = await getSources();
       setSources(nextSources);
       setScope((current) =>
         current && !nextSources.some((source) => source.doc_id === current) ? null : current,
       );
     } catch (err) {
+      setSources([]);
       setError((err as Error).message);
     }
   }, []);
@@ -219,7 +227,7 @@ export default function App() {
           <span className="brand-tag">answers with receipts</span>
         </div>
         <div className="header-meta">
-          <label className="api-key" title="Stored in this browser only">
+          <label className="api-key" title="Sent as X-API-Key; stored in this browser only">
             <span>key</span>
             <input
               type="password"
@@ -230,6 +238,18 @@ export default function App() {
               autoComplete="off"
             />
           </label>
+          <span
+            className={`role${me ? ` role-${me.role}` : ""}`}
+            title={
+              me
+                ? `Signed in as ${me.identity} (${me.role})`
+                : health?.auth_required
+                  ? "This server requires a key; enter an admin key above"
+                  : "Waiting for the server to report your role"
+            }
+          >
+            {me ? me.role : health?.auth_required ? "key required" : "…"}
+          </span>
           <div className="status">
             {health ? (
               <>
@@ -432,29 +452,31 @@ export default function App() {
           <div className="side-block">
             <div className="side-head">
               <h2>Corpus</h2>
-              {isAdmin && (
-                <>
-                  <input
-                    ref={fileRef}
-                    type="file"
-                    accept=".md,.markdown,.txt,.html,.htm,.pdf"
-                    hidden
-                    onChange={(event) => {
-                      const file = event.target.files?.[0];
-                      event.target.value = "";
-                      if (file) void upload(file);
-                    }}
-                  />
-                  <button
-                    className="ghost"
-                    onClick={() => fileRef.current?.click()}
-                    disabled={uploading}
-                    title="Upload a document from this computer"
-                  >
-                    {uploading ? "indexing…" : "add file"}
-                  </button>
-                </>
-              )}
+              <input
+                ref={fileRef}
+                type="file"
+                accept=".md,.markdown,.txt,.html,.htm,.pdf"
+                hidden
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  event.target.value = "";
+                  if (file) void upload(file);
+                }}
+              />
+              <button
+                className="ghost"
+                onClick={() => fileRef.current?.click()}
+                disabled={uploading || !isAdmin}
+                title={
+                  isAdmin
+                    ? "Upload a document from this computer"
+                    : health?.auth_required
+                      ? "Uploading requires an admin API key"
+                      : "Waiting for the server to confirm your role"
+                }
+              >
+                {uploading ? "indexing…" : "add file"}
+              </button>
             </div>
             <ul className="corpus">
               {sources.map((source) => (
@@ -488,6 +510,13 @@ export default function App() {
                 </li>
               ))}
             </ul>
+            {!isAdmin && (health?.auth_required || me) && (
+              <p className="muted small">
+                {me
+                  ? "this key is a reader; uploads need an admin key"
+                  : "enter an admin key above to add files"}
+              </p>
+            )}
             {sources.length > 0 && (
               <p className="muted small">click a document to ask only that one</p>
             )}

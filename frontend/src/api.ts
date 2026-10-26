@@ -25,6 +25,7 @@ export type Health = {
   chunks: number;
   embedder: string;
   provider: string;
+  auth_required?: boolean;
 };
 
 export type Source = {
@@ -110,11 +111,21 @@ function uploadHeaders(): Headers {
   return merged;
 }
 
+async function detail(response: Response): Promise<string> {
+  const text = await response.text();
+  try {
+    const payload = JSON.parse(text) as { detail?: unknown };
+    if (typeof payload.detail === "string") return payload.detail;
+  } catch {
+    // Not JSON; fall through to the raw body.
+  }
+  return text || `${response.status} ${response.statusText}`;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, { ...init, headers: headers(init) });
   if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(detail || `${response.status} ${response.statusText}`);
+    throw new Error(await detail(response));
   }
   return (await response.json()) as T;
 }
@@ -132,7 +143,7 @@ export async function uploadDocument(file: File): Promise<UploadResult> {
     body: form,
   });
   if (!response.ok) {
-    throw new Error((await response.text()) || `${response.status} ${response.statusText}`);
+    throw new Error(await detail(response));
   }
   return (await response.json()) as UploadResult;
 }
