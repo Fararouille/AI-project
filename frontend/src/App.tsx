@@ -1,14 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   askStream,
+  deleteDocument,
   getApiKey,
   getHealth,
+  getMe,
   getSources,
   runEvaluation,
   setApiKey,
+  uploadDocument,
   type AskResult,
   type EvalResponse,
   type Health,
+  type Me,
   type Source,
 } from "./api";
 
@@ -75,17 +79,85 @@ export default function App() {
   const [evaluation, setEvaluation] = useState<EvalResponse | null>(null);
   const [evalBusy, setEvalBusy] = useState(false);
   const [apiKey, setApiKeyValue] = useState(getApiKey);
+  const [me, setMe] = useState<Me | null>(null);
+  const [scope, setScope] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
+  const refresh = useCallback(async () => {
+    try {
+      const [nextHealth, nextSources] = await Promise.all([getHealth(), getSources()]);
+      setHealth(nextHealth);
+      setSources(nextSources);
+      setScope((current) =>
+        current && !nextSources.some((source) => source.doc_id === current) ? null : current,
+      );
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }, []);
+
   useEffect(() => {
-    getHealth().then(setHealth).catch((err: Error) => setError(err.message));
-    getSources().then(setSources).catch(() => setSources([]));
-  }, [apiKey]);
+    void refresh();
+    getMe()
+      .then(setMe)
+      .catch(() => setMe(null));
+  }, [apiKey, refresh]);
+
+  const isAdmin = me?.role === "admin";
+  const scopeDoc = sources.find((source) => source.doc_id === scope) ?? null;
 
   const updateApiKey = useCallback((value: string) => {
     setApiKeyValue(value);
     setApiKey(value);
   }, []);
+
+  const upload = useCallback(
+    async (file: File) => {
+      setUploading(true);
+      setError(null);
+      setNotice(null);
+      try {
+        const result = await uploadDocument(file);
+        const chunks = `${result.document_chunks} chunk${result.document_chunks === 1 ? "" : "s"}`;
+        setNotice(
+          `${result.replaced ? "Replaced" : "Added"} "${result.title}" · ${chunks}. Questions now target it.`,
+        );
+        setScope(result.doc_id);
+        await refresh();
+      } catch (err) {
+        setError((err as Error).message);
+      } finally {
+        setUploading(false);
+      }
+    },
+    [refresh],
+  );
+
+  const remove = useCallback(
+    async (source: Source) => {
+      if (
+        !window.confirm(
+          `Remove "${source.title}"? This deletes the uploaded file; the corpus is untouched.`,
+        )
+      ) {
+        return;
+      }
+      setError(null);
+      setNotice(null);
+      try {
+        await deleteDocument(source.doc_id);
+        setNotice(`Removed "${source.title}".`);
+        if (scope === source.doc_id) setScope(null);
+        await refresh();
+      } catch (err) {
+        setError((err as Error).message);
+      }
+    },
+    [refresh, scope],
+  );
 
   const submit = useCallback(
     async (raw?: string) => {
@@ -104,7 +176,7 @@ export default function App() {
 
       try {
         const result = await askStream(
-          { question: value, k, mode, rerank },
+          { question: value, k, mode, rerank, doc_ids: scope ? [scope] : undefined },
           (delta) => setStreamed((prev) => prev + delta),
           controller.signal,
         );
@@ -118,7 +190,7 @@ export default function App() {
         setBusy(false);
       }
     },
-    [busy, question, k, mode, rerank],
+    [busy, question, k, mode, rerank, scope],
   );
 
   const evaluate = useCallback(async () => {
@@ -183,7 +255,11 @@ export default function App() {
             <input
               value={question}
               onChange={(event) => setQuestion(event.target.value)}
-              placeholder="Ask a question about the handbook…"
+              placeholder={
+                scopeDoc
+                  ? `Ask about ${scopeDoc.title}…`
+                  : "Ask a question about the handbook…"
+              }
               aria-label="Question"
               autoFocus
             />
@@ -191,6 +267,16 @@ export default function App() {
               {busy ? "retrieving…" : "ask"}
             </button>
           </form>
+
+          {scopeDoc && (
+            <div className="scope">
+              <span className="scope-label">only</span>
+              <span className="scope-title">{scopeDoc.title}</span>
+              <button className="scope-clear" onClick={() => setScope(null)}>
+                search everything
+              </button>
+            </div>
+          )}
 
           <div className="controls">
             <label>
@@ -234,6 +320,7 @@ export default function App() {
           )}
 
           {error && <div className="error">{error}</div>}
+          {notice && <div className="notice">{notice}</div>}
 
           {(displayText || busy) && (
             <article className={`answer${busy ? " answer-busy" : ""}`}>
@@ -343,15 +430,67 @@ export default function App() {
           </div>
 
           <div className="side-block">
-            <h2>Corpus</h2>
+            <div className="side-head">
+              <h2>Corpus</h2>
+              {isAdmin && (
+                <>
+                  <input
+                    ref={fileRef}
+                    type="file"
+                    accept=".md,.markdown,.txt,.html,.htm,.pdf"
+                    hidden
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      event.target.value = "";
+                      if (file) void upload(file);
+                    }}
+                  />
+                  <button
+                    className="ghost"
+                    onClick={() => fileRef.current?.click()}
+                    disabled={uploading}
+                    title="Upload a document from this computer"
+                  >
+                    {uploading ? "indexing…" : "add file"}
+                  </button>
+                </>
+              )}
+            </div>
             <ul className="corpus">
               {sources.map((source) => (
-                <li key={source.doc_id}>
-                  <span className="corpus-title">{source.title}</span>
-                  <span className="corpus-count">{source.chunks}</span>
+                <li
+                  key={source.doc_id}
+                  className={scope === source.doc_id ? "corpus-active" : undefined}
+                >
+                  <button
+                    className="corpus-pick"
+                    onClick={() =>
+                      setScope((current) =>
+                        current === source.doc_id ? null : source.doc_id,
+                      )
+                    }
+                    title="Ask only this document"
+                  >
+                    <span className="corpus-title">{source.title}</span>
+                    {source.uploaded && <span className="corpus-badge">new</span>}
+                    <span className="corpus-count">{source.chunks}</span>
+                  </button>
+                  {source.uploaded && isAdmin && (
+                    <button
+                      className="corpus-remove"
+                      onClick={() => void remove(source)}
+                      aria-label={`Remove ${source.title}`}
+                      title="Remove this upload"
+                    >
+                      ×
+                    </button>
+                  )}
                 </li>
               ))}
             </ul>
+            {sources.length > 0 && (
+              <p className="muted small">click a document to ask only that one</p>
+            )}
           </div>
         </aside>
       </main>

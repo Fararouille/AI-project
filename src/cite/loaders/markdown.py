@@ -16,7 +16,9 @@ class MarkdownLoader:
     suffixes = frozenset({".md", ".markdown", ".txt"})
 
     def load(self, path: Path) -> LoadedDocument:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        # utf-8-sig strips the BOM that Windows editors commonly prepend; without
+        # it the first line is "\ufeff# Title" and the H1 goes undetected.
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
         for line in text.splitlines():
             stripped = line.strip()
             if stripped.startswith("# "):

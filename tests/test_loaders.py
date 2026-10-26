@@ -37,6 +37,14 @@ def test_markdown_title_falls_back_to_filename(tmp_path) -> None:
     assert load_document(path).title == "Rate Limits"
 
 
+def test_markdown_ignores_a_utf8_bom_before_the_title(tmp_path) -> None:
+    path = tmp_path / "bom.md"
+    path.write_bytes("# Real Title\n\nbody".encode("utf-8-sig"))
+    loaded = load_document(path)
+    assert loaded.title == "Real Title"
+    assert not loaded.text.startswith("\ufeff")
+
+
 def test_html_drops_navigation_scripts_and_footers() -> None:
     loaded = load_document(FIXTURES / "handbook.html")
     assert loaded.title == "Widget API"

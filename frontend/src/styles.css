@@ -249,6 +249,50 @@ button {
   cursor: pointer;
 }
 
+.scope {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 2px 4px;
+  padding: 7px 10px;
+  background: rgba(94, 234, 212, 0.06);
+  border: 1px solid var(--accent-dim);
+  border-radius: 7px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  flex-wrap: wrap;
+}
+
+.scope-label {
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10px;
+}
+
+.scope-title {
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scope-clear {
+  margin-left: auto;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 0;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.scope-clear:hover {
+  color: var(--text);
+}
+
 /* ---------------------------------------------------------------- examples */
 .examples {
   display: flex;
@@ -570,9 +614,9 @@ button {
 
 .corpus li {
   display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 5px 0;
+  align-items: center;
+  gap: 2px;
+  padding: 0;
   border-bottom: 1px solid #1a1f25;
   font-size: 12.5px;
 }
@@ -581,11 +625,64 @@ button {
   border-bottom: none;
 }
 
+.corpus li.corpus-active {
+  background: rgba(94, 234, 212, 0.06);
+  border-radius: 6px;
+}
+
+.corpus-pick {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 5px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  text-align: left;
+}
+
+.corpus-pick:hover {
+  background: var(--bg-raised);
+}
+
+.corpus-active .corpus-pick .corpus-title {
+  color: var(--text);
+}
+
 .corpus-title {
+  flex: 1;
   color: var(--text-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.corpus-badge {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+  border: 1px solid var(--accent-dim);
+  border-radius: 999px;
+  padding: 0 5px;
+}
+
+.corpus-remove {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 5px;
+}
+
+.corpus-remove:hover {
+  color: var(--danger);
+  background: rgba(248, 113, 113, 0.1);
 }
 
 .corpus-count {
@@ -616,6 +713,17 @@ button {
   font-family: var(--mono);
   font-size: 12.5px;
   white-space: pre-wrap;
+}
+
+.notice {
+  margin-top: 16px;
+  padding: 12px 14px;
+  background: rgba(94, 234, 212, 0.07);
+  border: 1px solid var(--accent-dim);
+  border-radius: 8px;
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 12.5px;
 }
 
 .footer {

@@ -135,6 +135,8 @@ class Settings:
     log_questions: bool = False
     judge: str = "lexical"
     pdf_ocr: str = "auto"
+    uploads_dir: Path = Path("data/uploads")
+    max_upload_mb: int = 20
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -160,6 +162,8 @@ class Settings:
             log_questions=os.getenv("CITE_LOG_QUESTIONS", "").strip().lower() in _TRUE,
             judge=os.getenv("CITE_JUDGE", "lexical").strip().lower() or "lexical",
             pdf_ocr=_choice_env("CITE_PDF_OCR", "auto", {"auto", "always", "off"}),
+            uploads_dir=Path(os.getenv("CITE_UPLOADS_DIR", "data/uploads")),
+            max_upload_mb=_int_env("CITE_MAX_UPLOAD_MB", 20),
         )
 
     @property
@@ -182,6 +186,11 @@ class Settings:
         if name == self.default_collection:
             return self.index_path
         return self.collections_dir / f"{name}{self.index_suffix}"
+
+    def uploads_path_for(self, collection: str | None = None) -> Path:
+        """Browser uploads are per collection so a corpus and its uploads stay separate."""
+        name = normalize_collection(collection, self.default_collection)
+        return self.uploads_dir / name
 
     def collection_paths(self) -> list[Path]:
         """Every index file on disk, one path per collection name.

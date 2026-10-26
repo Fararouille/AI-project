@@ -107,3 +107,18 @@ def test_empty_index_is_safe() -> None:
     index = Index([], HashingEmbedder(dim=64))
     assert index.search("anything", k=5) == []
     assert len(index) == 0
+
+
+def test_search_can_be_scoped_to_one_document() -> None:
+    chunks = [
+        make_chunk("a1", "Rate limits are 600 per minute.", doc_id="api"),
+        make_chunk("b1", "Rate limits are 250 per day.", doc_id="billing"),
+    ]
+    index = Index(chunks, HashingEmbedder(dim=64))
+
+    for mode in ("bm25", "dense", "hybrid"):
+        hits = index.search("rate limits", k=5, mode=mode, doc_ids={"api"})
+        assert hits, f"{mode} returned nothing for a scoped query"
+        assert {hit.chunk.doc_id for hit in hits} == {"api"}
+
+    assert index.search("rate limits", k=5, doc_ids=set()) == []

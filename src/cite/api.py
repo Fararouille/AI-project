@@ -11,6 +11,8 @@ The hardening here is deliberately bounded:
 * named collections stored as separate index files, so one corpus cannot leak
   into another through a shared id space
 * SQLite or JSON index storage, chosen by the configured file suffix
+* admin-only browser uploads, stored outside the read-only corpus and layered
+  back in on every rebuild, plus per-document scoping of ``/api/ask``
 
 What is still missing for real multi-tenancy is listed in the README: per-tenant
 embedding budgets, a shared vector server, and a reindex queue.
@@ -33,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -56,6 +58,7 @@ from .models import Answer, ConfigResult
 from .providers import get_provider
 from .ratelimit import Limiter, build_limiter
 from .retrieval import Index
+from .uploads import UploadError, stage_removal, store_upload, stored_documents
 
 FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
@@ -271,6 +274,7 @@ def load_or_build_indexes() -> dict[str, Index]:
             settings.corpus_dir,
             embedder=_configured_embedder() or get_embedder(),
             collection=settings.default_collection,
+            extra_roots=(settings.uploads_path_for(settings.default_collection),),
         )
         save_index(index, settings.index_path)
         indexes[settings.default_collection] = index
@@ -446,6 +450,8 @@ class AskRequest(BaseModel):
     mode: Literal["auto", "bm25", "dense", "hybrid"] = "auto"
     rerank: bool = False
     collection: str | None = None
+    # Restrict retrieval to specific documents, e.g. the file just uploaded.
+    doc_ids: list[str] | None = Field(default=None, max_length=50)
 
 
 class CitationModel(BaseModel):
@@ -508,6 +514,25 @@ class ReindexResponse(BaseModel):
     stats: dict
 
 
+class UploadResponse(BaseModel):
+    collection: str
+    doc_id: str
+    title: str
+    document_chunks: int
+    replaced: bool
+    documents: int
+    chunks: int
+    stats: dict
+
+
+class DeleteResponse(BaseModel):
+    collection: str
+    doc_id: str
+    documents: int
+    chunks: int
+    stats: dict
+
+
 class UsageResponse(BaseModel):
     auth_required: bool
     summary: dict
@@ -534,6 +559,55 @@ def _require_index(
         status_code=404,
         detail=f"collection {name!r} is not loaded; available: {', '.join(available)}",
     )
+
+
+def _resolve_scope(doc_ids: list[str] | None, index: Index) -> frozenset[str] | None:
+    """Validate a per-question document filter against the loaded collection."""
+    if not doc_ids:
+        return None
+    unique = sorted(set(doc_ids))
+    known = set(index.manifest.get("documents") or {})
+    if not known:
+        known = {chunk.doc_id for chunk in index.chunks}
+    missing = [doc_id for doc_id in unique if doc_id not in known]
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown document(s): {', '.join(missing)}",
+        )
+    return frozenset(unique)
+
+
+def _rebuild_index(name: str, settings: Settings, *, incremental: bool = True) -> Index:
+    """Rebuild one collection from its corpus plus uploads, then swap it in.
+
+    The write lock covers the read-modify-write cycle, so two uploads arriving at
+    once cannot both build from the same previous index and lose one document.
+    """
+    with state.lock:
+        destination = settings.index_path_for(name)
+        embedder = _configured_embedder() or get_embedder()
+
+        previous = None
+        if incremental and destination.exists():
+            try:
+                previous = load_index(destination, embedder, require_match=False)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                print(f"[cite] previous index unusable ({exc}); rebuilding")
+
+        index = build_index(
+            settings.corpus_dir,
+            embedder=embedder,
+            previous=previous,
+            incremental=incremental,
+            collection=name,
+            extra_roots=(settings.uploads_path_for(name),),
+        )
+        save_index(index, destination)
+        state.collections[name] = index
+        if name == settings.default_collection:
+            state.index = index
+        return index
 
 
 def _serialize(answer: Answer, collection: str) -> AskResponse:
@@ -613,6 +687,7 @@ def sources(
     principal: Principal = Depends(require_principal),
 ) -> list[dict]:
     name, index = _require_index(collection, principal)
+    uploaded_ids = stored_documents(_settings(), name)
     grouped: dict[str, dict] = {}
     for chunk in index.chunks:
         entry = grouped.setdefault(
@@ -623,6 +698,7 @@ def sources(
                 "collection": name,
                 "chunks": 0,
                 "headings": [],
+                "uploaded": chunk.doc_id in uploaded_ids,
             },
         )
         entry["chunks"] += 1
@@ -643,6 +719,7 @@ def ask(
         k=request.k,
         mode=request.mode,
         rerank=request.rerank,
+        doc_ids=_resolve_scope(request.doc_ids, index),
     )
     _record(answer, name, principal.identity)
     return _serialize(answer, name)
@@ -660,6 +737,7 @@ async def ask_stream(
         k=request.k,
         mode=request.mode,
         rerank=request.rerank,
+        doc_ids=_resolve_scope(request.doc_ids, index),
     )
     _record(answer, name, principal.identity)
 
@@ -748,32 +826,103 @@ def reindex(
             status_code=403,
             detail=f"API key is not allowed to read collection {name!r}",
         )
-    destination = settings.index_path_for(name)
-    embedder = _configured_embedder() or get_embedder()
-
-    previous = None
-    if options.incremental and destination.exists():
-        try:
-            previous = load_index(destination, embedder, require_match=False)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            print(f"[cite] previous index unusable ({exc}); rebuilding")
     try:
-        index = build_index(
-            settings.corpus_dir,
-            embedder=embedder,
-            previous=previous,
-            incremental=options.incremental,
-            collection=name,
-        )
+        index = _rebuild_index(name, settings, incremental=options.incremental)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    save_index(index, destination)
-    with state.lock:
-        state.collections[name] = index
-        if name == settings.default_collection:
-            state.index = index
     return ReindexResponse(
         collection=name,
+        documents=len(index.manifest.get("documents", {})),
+        chunks=len(index),
+        stats=index.stats.as_dict() if index.stats else {},
+    )
+
+
+@app.post("/api/documents", response_model=UploadResponse, status_code=201)
+def upload_document(
+    file: UploadFile = File(...),
+    principal: Principal = Depends(require_admin),
+) -> UploadResponse:
+    """Index one file from the browser into the default collection.
+
+    Uploads land in ``CITE_UPLOADS_DIR`` rather than the corpus directory, so the
+    corpus stays read-only and the uploaded file is still there after a restart.
+    Every rebuild layers uploads over the corpus, reusing unchanged chunks.
+    """
+    settings = _settings()
+    if settings.max_upload_mb <= 0:
+        raise HTTPException(
+            status_code=413,
+            detail="uploads are disabled; set CITE_MAX_UPLOAD_MB above zero",
+        )
+    limit = settings.max_upload_mb * 1024 * 1024
+    data = file.file.read(limit + 1)
+    if len(data) > limit:
+        raise HTTPException(
+            status_code=413,
+            detail=f"file exceeds CITE_MAX_UPLOAD_MB ({settings.max_upload_mb} MB)",
+        )
+
+    name = settings.default_collection
+    try:
+        stored = store_upload(settings, name, file.filename, data)
+    except UploadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    previous = state.collections.get(name) or state.index
+    replaced = stored.doc_id in (previous.manifest.get("documents", {}) if previous else {})
+
+    try:
+        index = _rebuild_index(name, settings)
+    except (FileNotFoundError, ValueError) as exc:
+        stored.restore()
+        raise HTTPException(status_code=400, detail=f"could not index upload: {exc}") from exc
+    except Exception:
+        stored.restore()
+        raise
+
+    return UploadResponse(
+        collection=name,
+        doc_id=stored.doc_id,
+        title=stored.title,
+        document_chunks=sum(1 for chunk in index.chunks if chunk.doc_id == stored.doc_id),
+        replaced=replaced,
+        documents=len(index.manifest.get("documents", {})),
+        chunks=len(index),
+        stats=index.stats.as_dict() if index.stats else {},
+    )
+
+
+@app.delete("/api/documents/{doc_id}", response_model=DeleteResponse)
+def delete_document(
+    doc_id: str,
+    principal: Principal = Depends(require_admin),
+) -> DeleteResponse:
+    """Remove an uploaded document and rebuild the collection without it.
+
+    Corpus files are never deleted through the API. If an upload was shadowing a
+    corpus document with the same id, the corpus version comes back on rebuild.
+    """
+    settings = _settings()
+    name = settings.default_collection
+    try:
+        staged = stage_removal(settings, name, doc_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    try:
+        index = _rebuild_index(name, settings)
+    except (FileNotFoundError, ValueError) as exc:
+        staged.restore()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception:
+        staged.restore()
+        raise
+    staged.discard()
+
+    return DeleteResponse(
+        collection=name,
+        doc_id=doc_id,
         documents=len(index.manifest.get("documents", {})),
         chunks=len(index),
         stats=index.stats.as_dict() if index.stats else {},

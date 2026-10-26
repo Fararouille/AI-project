@@ -66,6 +66,10 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     if args.ocr:
         os.environ["CITE_PDF_OCR"] = args.ocr
 
+    uploads = None if args.no_uploads else (
+        Path(args.uploads) if args.uploads else settings.uploads_path_for(collection)
+    )
+
     previous = None
     if destination.exists() and not args.full:
         try:
@@ -81,6 +85,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         previous=previous,
         incremental=not args.full,
         collection=collection,
+        extra_roots=(uploads,) if uploads else (),
     )
     destination = save_index(index, destination)
     stats = index.stats
@@ -89,6 +94,8 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         f"indexed {documents} documents into {len(index)} chunks "
         f"-> {destination} (embedder: {embedder.name}, collection: {collection})"
     )
+    if uploads and uploads.exists():
+        print(f"uploads layered from {uploads}")
     print(
         f"{stats.chunks_reused} chunks reused, {stats.chunks_embedded} embedded "
         f"in {stats.elapsed_ms:.1f} ms"
@@ -106,6 +113,12 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 def cmd_ask(args: argparse.Namespace) -> int:
     settings = Settings.from_env()
     index = _open_index(_index_path(args, settings), args.embedder)
+    if args.doc:
+        known = set(index.manifest.get("documents") or {})
+        missing = sorted(set(args.doc) - known)
+        if missing:
+            print(f"[cite] unknown document(s): {', '.join(missing)}", file=sys.stderr)
+            return 2
     answer = answer_question(
         index,
         args.question,
@@ -113,6 +126,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
         k=args.k,
         mode=args.mode,
         rerank=args.rerank,
+        doc_ids=args.doc,
     )
     if args.json:
         payload = {
@@ -204,6 +218,7 @@ def cmd_info(args: argparse.Namespace) -> int:
         f"({'present' if index_path.exists() else 'missing - run cite ingest'})"
     )
     print(f"golden: {settings.golden_path}")
+    print(f"uploads: {settings.uploads_path_for(args.collection)}")
     print(f"collections: {', '.join(settings.collection_names())}")
     print(
         f"auth: {'enabled' if settings.auth_enabled else 'disabled'} | "
@@ -250,12 +265,26 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", "always", "off"],
         help="scanned-PDF OCR mode; overrides CITE_PDF_OCR for this run",
     )
+    ingest.add_argument(
+        "--uploads",
+        help="directory layered over the corpus; defaults to CITE_UPLOADS_DIR/<collection>",
+    )
+    ingest.add_argument(
+        "--no-uploads",
+        action="store_true",
+        help="ignore browser uploads even if the upload directory exists",
+    )
     ingest.set_defaults(func=cmd_ingest)
 
     ask = subparsers.add_parser("ask", help="ask a question against the index")
     ask.add_argument("question")
     ask.add_argument("--index", help="index path; defaults to the collection's path")
     ask.add_argument("--collection", default=settings.default_collection)
+    ask.add_argument(
+        "--doc",
+        action="append",
+        help="restrict retrieval to this document id; repeatable",
+    )
     ask.add_argument("--provider", default=None)
     ask.add_argument("--json", action="store_true")
     _add_retrieval_flags(ask)

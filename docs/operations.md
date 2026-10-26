@@ -19,6 +19,8 @@ explicit list of what the current design does not solve.
 | `CITE_INDEX_PATH` | `data/index.sqlite3` | Default collection. `.json` keeps the original single-file store. |
 | `CITE_COLLECTIONS_DIR` | `data/collections` | Named collections, `<name>.sqlite3` by default or `<name>.json` when the default is JSON. |
 | `CITE_COLLECTION` | `default` | Default collection when a request omits one. |
+| `CITE_UPLOADS_DIR` | `data/uploads` | Browser uploads, one subdirectory per collection. |
+| `CITE_MAX_UPLOAD_MB` | `20` | Per-file upload cap; `0` disables uploads. |
 | `CITE_GOLDEN_PATH` | `eval/golden.yaml` | Evaluation questions. |
 | `CITE_EMBEDDER` | `hashing` | `openai` requires `OPENAI_API_KEY`. |
 | `CITE_LLM_PROVIDER` | `mock` | `openai` / `anthropic` require their keys. |
@@ -41,8 +43,8 @@ working offline.
 2. Set `CITE_API_KEYS` to long random values, not `dev-secret`. Split administrative keys
    with `CITE_ADMIN_KEYS` and grant collections with `CITE_KEY_ACLS`.
 3. Put the process behind a TLS-terminating proxy. The app speaks plain HTTP.
-4. Persist `/data/index.sqlite3`, `/data/collections/`, `/data/usage.db`, and
-   `/data/rate-limit.db`.
+4. Persist `/data/index.sqlite3`, `/data/collections/`, `/data/uploads/`,
+   `/data/usage.db`, and `/data/rate-limit.db`.
 5. Prefer one process per container, or several workers on one host if they share the same
    SQLite files. A rate-limit database on a different host per replica is not shared.
 6. Check `GET /api/health` after start. `status` is `degraded` when no default index
@@ -55,8 +57,9 @@ with `hmac.compare_digest`. The usage log stores `key:<sha256-prefix>`, never th
 
 `/api/health` is public so container health checks work without credentials. Everything
 else that can spend money or mutate state requires a valid key when `CITE_API_KEYS` is
-set: `/api/ask`, `/api/ask/stream`, `/api/eval`, `/api/reindex`, `/api/usage`, `/api/me`,
-and `/api/sources`. `/api/sources` is included because document titles can be sensitive.
+set: `/api/ask`, `/api/ask/stream`, `/api/eval`, `/api/reindex`, `/api/documents`
+(POST and DELETE), `/api/usage`, `/api/me`, and `/api/sources`. `/api/sources` is included
+because document titles can be sensitive.
 
 Two optional maps turn the key list into a least-privilege policy:
 
@@ -66,8 +69,9 @@ export CITE_ADMIN_KEYS='admin-key'
 export CITE_KEY_ACLS='reader-key:handbook,support;legal-key:legal;admin-key:*'
 ```
 
-- **Admin keys** may `POST /api/reindex`, `POST /api/eval`, and `GET /api/usage`. They may
-  also read every collection, regardless of an ACL entry.
+- **Admin keys** may `POST /api/reindex`, `POST /api/documents`, `DELETE
+  /api/documents/{id}`, `POST /api/eval`, and `GET /api/usage`. They may also read every
+  collection, regardless of an ACL entry.
 - **Reader keys** may call `/api/ask`, `/api/ask/stream`, `/api/sources`, and `/api/me`,
   but only against their granted collections.
 - **Unlisted keys** are still valid but have no collections and no admin rights. Requests
@@ -206,7 +210,49 @@ key; `--judge` and `/api/eval?judge=` override the environment for one run. Eval
 output always records the judge that ran. A model judge is not ground truth, is not
 reproducible across model versions, and costs money per call.
 
-## 8. Backups and recovery
+## 8. Uploads
+
+`POST /api/documents` accepts one multipart `file` field and indexes it into the default
+collection. The bundled UI calls the same endpoint from **Corpus → add file** and then
+scopes the next question to the new document id.
+
+```bash
+curl -s localhost:8000/api/documents -F "file=@notes/widgets.pdf" -H "X-API-Key: $ADMIN"
+curl -s localhost:8000/api/ask -H "X-API-Key: $READER" -H 'content-type: application/json' \
+  -d '{"question":"What is the widget limit?","doc_ids":["widgets"]}'
+curl -s -X DELETE localhost:8000/api/documents/widgets -H "X-API-Key: $ADMIN"
+```
+
+Properties:
+
+- **Admin-only.** Upload and delete use the same role check as `/api/reindex`. With
+  `CITE_API_KEYS` empty, the local caller is an admin.
+- **Outside the corpus.** Files are written to `CITE_UPLOADS_DIR/<collection>/`
+  (`data/uploads/default/` by default), never to `CITE_CORPUS_DIR`. Extracted text is what
+  gets indexed; the original file stays on disk for later rebuilds.
+- **Layered, not mixed.** A rebuild reads the corpus first and the upload directory second,
+  so a same-id upload shadows the corpus document. Deleting the upload restores the corpus
+  version. Unchanged chunks and vectors are reused.
+- **Name handling.** The browser-supplied name is reduced to its last path component, then
+  to a slug plus a whitelisted suffix. `../../escape.md` becomes `escape.md` inside the
+  upload directory. Re-uploading an id replaces the old file, including across extensions.
+- **Validation.** The file must parse to non-empty text before it replaces anything, and
+  the whole operation is rolled back if the rebuild fails. The same OCR rules apply as for
+  `cite ingest`.
+- **Size.** `CITE_MAX_UPLOAD_MB` defaults to 20 and `0` disables uploads. The limit is
+  checked after Starlette spools the multipart body to disk, so a reverse proxy body limit
+  is still the right place to reject huge requests early.
+- **Synchronous.** Uploading embeds the new document and saves the index before responding.
+  A large file under a hosted embedder can take seconds; do not expose this to untrusted
+  users without a queue and a per-tenant quota.
+- **Scoping.** `doc_ids` on `/api/ask` filters the candidate set before ranking. Unknown ids
+  return `404`. The CLI equivalent is `cite ask "..." --doc widgets`.
+
+Not covered: virus scanning, per-user quotas, document-level permissions inside a
+collection, and uploads into named collections (the endpoint targets the default collection;
+use `cite ingest --collection ...` for the others).
+
+## 9. Backups and recovery
 
 - **Indexes**: reproducible from the corpus plus the embedder. Back them up only to avoid
   re-embedding cost. For SQLite, use `sqlite3 data/index.sqlite3 ".backup ..."` while the
@@ -215,25 +261,31 @@ reproducible across model versions, and costs money per call.
   atomic `os.replace` swaps.
 - **Usage and rate-limit DBs**: back up if the numbers matter. `sqlite3 data/usage.db
   ".backup ..."` is safe while the service is running.
-- **Corpus**: the actual source of truth. Version it outside the container.
+- **Corpus and uploads**: the actual source of truth. Version the corpus outside the
+  container and back up `data/uploads/`; neither can be regenerated from the index.
+  Indexes can always be rebuilt from them.
 
 SQLite index saves run inside one `BEGIN IMMEDIATE` transaction, so a crash leaves the
 previous committed state rather than a half-written index. JSON writes go to a temporary
-file and are swapped in with `os.replace`. A crash during a usage write can lose the last
-request, not corrupt earlier rows. A schema-version mismatch is reported explicitly;
-re-ingest to migrate rather than editing the file by hand.
+file and are swapped in with `os.replace`. Uploads are written to a temporary same-suffix
+file, parsed, and only then swapped into place; a failed rebuild restores the previous
+bytes. A crash during a usage write can lose the last request, not corrupt earlier rows. A
+schema-version mismatch is reported explicitly; re-ingest to migrate rather than editing
+the file by hand.
 
-## 9. What is still missing
+## 10. What is still missing
 
 These are the honest gaps before calling this multi-tenant production software:
 
 1. **Cross-host shared state.** Rate limits and usage share one SQLite file per host;
    replicas on different hosts do not. Indexes are loaded from local disk per process.
 2. **Document-level authorization.** ACLs stop at the collection. There is no per-document
-   filter, redaction, or tenant namespace inside a collection.
+   filter, redaction, or tenant namespace inside a collection, so a reader granted a
+   collection can ask about every uploaded file in it.
 3. **A vector store with concurrent writers.** SQLite removes the full rewrite and gives
    per-document upserts, but one file still has one writer and BM25 is rebuilt in memory.
-4. **An ingestion queue.** `POST /api/reindex` is synchronous and holds a request open.
+4. **An ingestion queue.** `POST /api/reindex` and uploads are synchronous and hold a
+   request open. There is no virus scanning, resumable upload, or per-user file quota.
 5. **Cost controls.** There is a token/cost log but no per-key or per-tenant budget
    enforcement in the request path.
 6. **Evaluation in CI against a hosted model.** The default harness uses the offline mock

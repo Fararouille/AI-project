@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 
 from .models import Answer, Citation, Scored
 from .providers import Provider, get_provider
@@ -46,15 +46,20 @@ def answer_question(
     k: int = 5,
     mode: str = "auto",
     rerank: bool = False,
+    doc_ids: Collection[str] | None = None,
 ) -> Answer:
-    """Retrieve, generate, and attach citations. Latency covers the whole pipeline."""
+    """Retrieve, generate, and attach citations. Latency covers the whole pipeline.
+
+    ``doc_ids`` scopes retrieval to specific documents, so a reader can ask about
+    the file they just uploaded instead of the whole collection.
+    """
     question = question.strip()
     if not question:
         raise ValueError("question must not be empty")
 
     started = time.perf_counter()
     resolved_mode = index.resolve_mode(mode)
-    hits = index.search(question, k=k, mode=resolved_mode, rerank=rerank)
+    hits = index.search(question, k=k, mode=resolved_mode, rerank=rerank, doc_ids=doc_ids)
     provider = provider or get_provider()
     result = provider.generate(question, hits)
     elapsed_ms = (time.perf_counter() - started) * 1000.0

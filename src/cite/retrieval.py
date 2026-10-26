@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 
 from .embeddings import Embedder, get_embedder
 from .models import Chunk, Scored
@@ -58,7 +58,12 @@ class BM25Index:
         get the default IDF by passing an unstemmed term."""
         return self._idf.get(stem(term), self._default_idf)
 
-    def search(self, query: str, k: int = 10) -> list[Scored]:
+    def search(
+        self,
+        query: str,
+        k: int = 10,
+        doc_ids: frozenset[str] | None = None,
+    ) -> list[Scored]:
         query_terms = terms(query)
         if not query_terms or not self.chunks:
             return []
@@ -75,7 +80,15 @@ class BM25Index:
                 contribution = idf * (freq * (self.k1 + 1.0)) / (freq + norm)
                 scores[position] = scores.get(position, 0.0) + contribution
 
-        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)[:k]
+        ranked = sorted(
+            (
+                (position, score)
+                for position, score in scores.items()
+                if doc_ids is None or self.chunks[position].doc_id in doc_ids
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:k]
         return [
             Scored(chunk=self.chunks[position], score=score, rank=rank)
             for rank, (position, score) in enumerate(ranked, start=1)
@@ -111,13 +124,19 @@ class DenseIndex:
                     )
             self.vectors = [list(vector) for vector in vectors]
 
-    def search(self, query: str, k: int = 10) -> list[Scored]:
+    def search(
+        self,
+        query: str,
+        k: int = 10,
+        doc_ids: frozenset[str] | None = None,
+    ) -> list[Scored]:
         if not self.chunks:
             return []
         query_vector = self.embedder.embed([query])[0]
         scored = [
             (position, sum(a * b for a, b in zip(query_vector, vector, strict=False)))
             for position, vector in enumerate(self.vectors)
+            if doc_ids is None or self.chunks[position].doc_id in doc_ids
         ]
         scored.sort(key=lambda item: item[1], reverse=True)
         return [
@@ -259,10 +278,17 @@ class Index:
         mode: str = "auto",
         rerank: bool = False,
         pool: int | None = None,
+        doc_ids: Collection[str] | None = None,
     ) -> list[Scored]:
-        """Retrieve ``k`` chunks. ``pool`` controls how many candidates each retriever emits."""
+        """Retrieve ``k`` chunks. ``pool`` controls how many candidates each retriever emits.
+
+        ``doc_ids`` restricts the candidate set *before* ranking, which is how the
+        UI asks a question about one uploaded document. Filtering after top-k would
+        lose in-scope chunks whenever an out-of-scope chunk ranked higher.
+        """
         if not self.chunks:
             return []
+        allowed = None if doc_ids is None else frozenset(doc_ids)
         mode = self.resolve_mode(mode)
         # Retrieve a deeper candidate pool than k. Rank fusion and the reranker
         # both need alternatives to promote; when depth == k the fusion stage can
@@ -270,12 +296,15 @@ class Index:
         depth = pool or max(k * 4, 20)
 
         if mode == "bm25":
-            hits = self.bm25.search(query, depth)
+            hits = self.bm25.search(query, depth, allowed)
         elif mode == "dense":
-            hits = self.dense.search(query, depth)
+            hits = self.dense.search(query, depth, allowed)
         elif mode == "hybrid":
             hits = reciprocal_rank_fusion(
-                [self.bm25.search(query, depth), self.dense.search(query, depth)]
+                [
+                    self.bm25.search(query, depth, allowed),
+                    self.dense.search(query, depth, allowed),
+                ]
             )[:depth]
         else:
             raise ValueError(f"unknown retrieval mode {mode!r}")

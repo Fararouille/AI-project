@@ -32,6 +32,32 @@ export type Source = {
   title: string;
   chunks: number;
   headings: string[];
+  uploaded?: boolean;
+};
+
+export type Me = {
+  identity: string;
+  role: "admin" | "reader";
+  collections: string[] | null;
+};
+
+export type UploadResult = {
+  collection: string;
+  doc_id: string;
+  title: string;
+  document_chunks: number;
+  replaced: boolean;
+  documents: number;
+  chunks: number;
+  stats: Record<string, unknown>;
+};
+
+export type DeleteResult = {
+  collection: string;
+  doc_id: string;
+  documents: number;
+  chunks: number;
+  stats: Record<string, unknown>;
 };
 
 export type EvalRow = {
@@ -76,6 +102,14 @@ function headers(init?: RequestInit): Headers {
   return merged;
 }
 
+/** FormData sets its own multipart boundary; setting Content-Type breaks it. */
+function uploadHeaders(): Headers {
+  const merged = new Headers();
+  const key = getApiKey();
+  if (key) merged.set("X-API-Key", key);
+  return merged;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, { ...init, headers: headers(init) });
   if (!response.ok) {
@@ -87,6 +121,26 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const getHealth = () => request<Health>("/api/health");
 export const getSources = () => request<Source[]>("/api/sources");
+export const getMe = () => request<Me>("/api/me");
+
+export async function uploadDocument(file: File): Promise<UploadResult> {
+  const form = new FormData();
+  form.append("file", file);
+  const response = await fetch("/api/documents", {
+    method: "POST",
+    headers: uploadHeaders(),
+    body: form,
+  });
+  if (!response.ok) {
+    throw new Error((await response.text()) || `${response.status} ${response.statusText}`);
+  }
+  return (await response.json()) as UploadResult;
+}
+
+export const deleteDocument = (docId: string) =>
+  request<DeleteResult>(`/api/documents/${encodeURIComponent(docId)}`, {
+    method: "DELETE",
+  });
 
 export const runEvaluation = () =>
   request<EvalResponse>("/api/eval", { method: "POST" });
@@ -96,6 +150,7 @@ export type AskOptions = {
   k: number;
   mode: string;
   rerank: boolean;
+  doc_ids?: string[];
 };
 
 export function ask(options: AskOptions): Promise<AskResult> {

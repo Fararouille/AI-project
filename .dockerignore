@@ -16,6 +16,7 @@ data/index.json
 data/index.sqlite3
 data/index.sqlite3-*
 data/collections/
+data/uploads/
 data/usage.db
 data/usage.db-*
 data/rate-limit.db

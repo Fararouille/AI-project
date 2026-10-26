@@ -85,7 +85,7 @@ class HTMLLoader:
                 "`pip install -e '.[loaders]'` or `pip install beautifulsoup4`"
             ) from exc
 
-        soup = BeautifulSoup(path.read_text(encoding="utf-8", errors="replace"), "html.parser")
+        soup = BeautifulSoup(path.read_text(encoding="utf-8-sig", errors="replace"), "html.parser")
         for tag in soup.find_all(_SKIP_TAGS):
             tag.decompose()
 

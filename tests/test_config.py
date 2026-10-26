@@ -45,6 +45,12 @@ def test_auth_disabled_makes_the_local_caller_an_admin() -> None:
     assert principal.can_read("anything")
 
 
+def test_upload_paths_are_per_collection() -> None:
+    configured = settings(uploads_dir=Path("data/uploads"))
+    assert configured.uploads_path_for(None) == Path("data/uploads/default")
+    assert configured.uploads_path_for("Handbook") == Path("data/uploads/handbook")
+
+
 def test_keys_keep_full_access_when_no_acl_map_is_configured() -> None:
     principal = settings(api_keys=("key-a",)).principal("key-a", "key:abc")
     assert principal.role == "reader"

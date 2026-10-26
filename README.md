@@ -255,6 +255,8 @@ production controls on:
 | `CITE_INDEX_PATH` | `data/index.sqlite3` | index for the default collection (`.json` still works) |
 | `CITE_COLLECTIONS_DIR` | `data/collections` | indexes for named collections |
 | `CITE_COLLECTION` | `default` | default collection name |
+| `CITE_UPLOADS_DIR` | `data/uploads` | browser uploads, one directory per collection |
+| `CITE_MAX_UPLOAD_MB` | `20` | per-file upload cap; `0` disables uploads |
 | `CITE_GOLDEN_PATH` | `eval/golden.yaml` | evaluation questions |
 | `CITE_JUDGE` | `lexical` | answer-support judge: `lexical`, `openai`, or `anthropic` |
 | `CITE_PDF_OCR` | `auto` | scanned-PDF OCR: `auto`, `always`, or `off` |
@@ -276,10 +278,10 @@ curl -s localhost:8000/api/me    -H 'X-API-Key: reader-key'   # role + granted c
 
 Auth is off when `CITE_API_KEYS` is empty. Once it is on **and** either map is configured,
 the service is least-privilege: a reader can only read its listed collections, an unlisted
-key gets none, and only admin keys can `POST /api/reindex`, `POST /api/eval`, or read
-`/api/usage`. If neither map is set, valid keys keep the old full-access behaviour so
-existing deployments do not break silently. `/api/health` stays public for container health
-checks.
+key gets none, and only admin keys can reindex, upload or delete documents, run evaluation,
+or read `/api/usage`. If neither map is set, valid keys keep the old full-access behaviour
+so existing deployments do not break silently. `/api/health` stays public for container
+health checks.
 
 Rate limiting is a token bucket per identity. The default SQLite backend puts the bucket in
 one file, so `uvicorn --workers 4` spends one budget instead of four; `memory` preserves
@@ -383,6 +385,39 @@ The index file contains the text of every chunk and its vectors — the answer i
 from that text. Keep a private corpus and its index out of version control;
 `data/corpus/` is committed here only because it is synthetic.
 
+### Adding one document from the browser
+
+`cite serve`, open the UI, and use **Corpus → add file**. The file is parsed by the same
+loader as `cite ingest`, indexed into the default collection, and marked `new` in the
+corpus list. Click any document to scope the next question to it; click again to search
+the whole collection.
+
+The API is the same operation:
+
+```bash
+curl -s localhost:8000/api/documents \
+  -F "file=@$HOME/notes/widgets.pdf"
+# {"doc_id":"widgets","title":"Widgets","document_chunks":4,"replaced":false,...}
+
+curl -s localhost:8000/api/ask \
+  -H 'content-type: application/json' \
+  -d '{"question":"What is the widget limit?","doc_ids":["widgets"]}'
+
+curl -s -X DELETE localhost:8000/api/documents/widgets
+```
+
+- Uploads live under `CITE_UPLOADS_DIR/<collection>/` (default `data/uploads/default/`),
+  never in the corpus, so the checked-in corpus and the Docker image stay reproducible.
+- Every rebuild layers uploads over the corpus and reuses unchanged chunks. An upload
+  with the same document id shadows the corpus file; deleting it restores the corpus one.
+- The same suffixes as ingestion are accepted, up to `CITE_MAX_UPLOAD_MB` (20 MB by
+  default). Re-uploading a name replaces it, including across extensions.
+- Upload and delete are admin-only, like `/api/reindex`. With auth off the local caller is
+  an admin. Uploads currently target the default collection; named collections are still
+  built with `cite ingest --collection ...`.
+- `doc_ids` on `/api/ask` (and `--doc` on `cite ask`) restricts retrieval before ranking,
+  so a one-document question cannot pick up a better-scoring chunk from elsewhere.
+
 With a semantic embedder, re-ingest using the same embedder (`--embedder openai`) so the
 indexed chunks and the incoming query are embedded in the same space. Changing the
 embedder deliberately invalidates the manifest and triggers a full rebuild.
@@ -398,6 +433,7 @@ embedder deliberately invalidates the manifest and triggers a full rebuild.
 | Separate index file per collection | True id isolation, trivial to reason about | Copies the corpus per collection; no cross-collection search |
 | SQLite index with per-document patches | Incremental saves stay incremental | Still one writer per file; BM25 is rebuilt in memory on load |
 | JSON store kept behind the suffix | Small corpora stay diffable; old deployments keep working | Two persistence paths to test |
+| Uploads outside the corpus, layered on rebuild | Corpus stays read-only; `reindex` keeps user files | Admin-only, default collection, synchronous rebuild |
 | Lexical support judge by default | Free, offline, deterministic, reproducible | Cannot recognise paraphrase; the number is a proxy |
 | SQLite token bucket by default | Workers on one host share one budget | Not shared across hosts; needs Redis or a gateway to scale out |
 | SQLite usage log | Queryable without infrastructure | Not a metrics system; single writer |
@@ -431,6 +467,11 @@ embedder deliberately invalidates the manifest and triggers a full rebuild.
   background job.
 - **HTML extraction is heuristic.** It drops anything it considers chrome (navigation,
   scripts, footers, forms); unusual layouts can lose content.
+- **Uploads are a single-collection, single-box convenience.** The endpoint takes one file,
+  rebuilds synchronously, and targets the default collection. There is no virus scan, no
+  per-user quota, no resumable chunked upload, and no document-level permission: a reader
+  granted the collection can ask about every upload in it. Put an object store and a queue
+  in front before accepting files from untrusted users.
 - **Collections isolate ids, not documents.** With `CITE_KEY_ACLS` a key can be limited to
   named collections, and an unlisted key gets none. There is still no document-level
   filtering, per-tenant embedding budget, or query-time redaction inside a collection.
@@ -456,9 +497,10 @@ src/cite/
   providers.py    extractive mock, OpenAI, Anthropic, claim judging
   judges.py       lexical (default) and hosted-model support judges
   ratelimit.py    memory and shared SQLite token buckets
+  uploads.py      browser file validation, storage outside the corpus, safe removal
   answer.py       retrieval → generation → citation resolution
   evaluation.py   recall@k, MRR, nDCG@k, answer checks, Markdown rendering
-  api.py          FastAPI, auth/roles/ACLs, rate limit, usage log, collections
+  api.py          FastAPI, auth/roles/ACLs, uploads, rate limit, usage log, collections
   cli.py          ingest / ask / eval / serve / info
 scripts/
   benchmark_ingest.py   full vs incremental, JSON vs SQLite measurement
@@ -469,22 +511,23 @@ eval/
 docs/
   operations.md         deployment checklist and multi-tenant gaps
 data/corpus/            14-document product handbook used as the demo corpus
-tests/                  152 tests: loaders, manifests, store, metrics, citations, hardening
+tests/                  168 tests: loaders, uploads, manifests, store, metrics, citations
 ```
 
 ## Tests
 
 ```bash
-pytest            # 151 passed, 1 skipped without Tesseract
+pytest            # 167 passed, 1 skipped without Tesseract
 ruff check src tests scripts
 ```
 
 The skip is the scanned-PDF OCR integration test; CI installs the Tesseract binary so it
 runs there. The suite covers the parts that are easy to get subtly wrong: nDCG against known
 values, chunk overlap coverage, BM25 idf behaviour, citation marker bounds, PDF/HTML
-extraction, OCR failure modes, manifest reuse and invalidation, JSON and SQLite round trips,
-per-document store patches, auth roles and ACLs, both rate-limit backends, usage aggregation,
-judge selection, collection scoping, and the HTTP contract.
+extraction, OCR failure modes, upload validation, title and BOM handling, and traversal,
+manifest reuse and invalidation, JSON and SQLite round trips, per-document store patches,
+auth roles and ACLs, both rate-limit backends, usage aggregation, judge selection, document
+scoping, collection scoping, and the HTTP contract.
 
 ## Deployment
 
@@ -495,11 +538,11 @@ docker run -p 8000:8000 cite
 
 The image builds the frontend, installs the loader and OCR extras plus the Tesseract
 binary, and builds `data/index.sqlite3` from `data/corpus` at build time, so container
-start-up needs no ingestion step. Generated indexes, collections, the usage database, and
-the rate-limit database are excluded by `.dockerignore`; the image always indexes the
-committed corpus rather than a developer's local state. Replace `data/corpus` before
-building to ship your own documents, and mount a volume over `data/` if you want the SQLite
-usage and rate-limit logs to survive a restart.
+start-up needs no ingestion step. Generated indexes, collections, uploads, the usage
+database, and the rate-limit database are excluded by `.dockerignore`; the image always
+indexes the committed corpus rather than a developer's local state. Replace `data/corpus`
+before building to ship your own documents, and mount a volume over `data/` if you want
+uploads and the SQLite usage and rate-limit logs to survive a restart.
 
 For anything beyond a demo, set `CITE_API_KEYS`, split admin keys with `CITE_ADMIN_KEYS`,
 grant collections with `CITE_KEY_ACLS`, put the container behind TLS, and follow

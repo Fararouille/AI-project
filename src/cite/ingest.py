@@ -24,8 +24,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -35,7 +35,7 @@ from .loaders import SUPPORTED_SUFFIXES, load_document
 from .models import Document
 from .retrieval import Index
 from .store import is_sqlite_path
-from .text import normalize
+from .text import normalize, slug
 
 MANIFEST_VERSION = 1
 
@@ -84,7 +84,7 @@ class BuildStats:
 
 
 def _slug(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "document"
+    return slug(value) or "document"
 
 
 def _fingerprint(document: Document) -> str:
@@ -105,32 +105,46 @@ def load_file(path: Path, root: Path | None = None) -> Document:
     )
 
 
-def load_documents(root: str | Path) -> list[Document]:
-    """Load every supported file under ``root``, sorted for reproducible chunk ids."""
-    base = Path(root)
-    if not base.exists():
-        raise FileNotFoundError(f"corpus directory not found: {base}")
-    files = sorted(
-        path
-        for path in base.rglob("*")
-        if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
-    )
-    if not files:
-        supported = ", ".join(sorted(SUPPORTED_SUFFIXES))
-        raise ValueError(f"no supported files found under {base} (supported: {supported})")
+def load_documents(roots: str | Path | Sequence[str | Path]) -> list[Document]:
+    """Load every supported file under one or more roots.
 
-    documents: list[Document] = []
-    seen: set[str] = set()
-    for path in files:
-        document = load_file(path, base)
-        if document.doc_id in seen:
-            # Two directories can contain "overview.md". Keep both instead of
-            # letting one silently overwrite the other in the manifest.
-            digest = hashlib.blake2b(str(path).encode("utf-8"), digest_size=3).hexdigest()
-            document = replace(document, doc_id=f"{document.doc_id}-{digest}")
-        seen.add(document.doc_id)
-        documents.append(document)
-    return documents
+    Later roots win when two files produce the same document id. The API uses this
+    to layer browser uploads over the read-only corpus: uploading ``limits.md``
+    replaces the corpus ``limits.md`` until the upload is deleted. Duplicate ids
+    inside a single root are disambiguated instead, so two directories that both
+    contain ``overview.md`` remain two documents.
+    """
+    if isinstance(roots, (str, Path)):
+        bases = [Path(roots)]
+    else:
+        bases = [Path(root) for root in roots]
+    existing = [base for base in bases if base.exists()]
+    if not existing:
+        raise FileNotFoundError(f"corpus directory not found: {', '.join(map(str, bases))}")
+
+    documents: dict[str, Document] = {}
+    for base in existing:
+        files = sorted(
+            path
+            for path in base.rglob("*")
+            if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
+        )
+        seen: set[str] = set()
+        for path in files:
+            document = load_file(path, base)
+            if document.doc_id in seen:
+                digest = hashlib.blake2b(
+                    str(path).encode("utf-8"), digest_size=3
+                ).hexdigest()
+                document = replace(document, doc_id=f"{document.doc_id}-{digest}")
+            seen.add(document.doc_id)
+            documents[document.doc_id] = document
+
+    if not documents:
+        supported = ", ".join(sorted(SUPPORTED_SUFFIXES))
+        searched = ", ".join(str(base) for base in existing)
+        raise ValueError(f"no supported files found under {searched} (supported: {supported})")
+    return list(documents.values())
 
 
 def _reuse_reason(
@@ -171,15 +185,18 @@ def build_index(
     previous: Index | None = None,
     incremental: bool = True,
     collection: str = "default",
+    extra_roots: Sequence[str | Path] = (),
 ) -> Index:
     """Build an index, reusing chunks and vectors from ``previous`` when possible.
 
-    Returns an :class:`~cite.retrieval.Index` whose ``stats`` attribute describes
-    the work performed. Pass ``incremental=False`` to force a full rebuild.
+    ``extra_roots`` are layered over ``root``; the API passes the per-collection
+    upload directory so browser uploads survive a corpus rebuild. Returns an
+    :class:`~cite.retrieval.Index` whose ``stats`` attribute describes the work
+    performed. Pass ``incremental=False`` to force a full rebuild.
     """
     started = time.perf_counter()
     embedder = embedder or get_embedder()
-    documents = load_documents(root)
+    documents = load_documents((root, *extra_roots))
 
     reuse, reason = _reuse_reason(previous, embedder, max_words, overlap_words, collection)
     if not incremental:

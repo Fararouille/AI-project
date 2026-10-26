@@ -47,6 +47,16 @@ def normalize(text: str) -> str:
     return _BLANKLINES_RE.sub("\n\n", text).strip()
 
 
+def slug(text: str) -> str:
+    """Filesystem- and URL-safe identifier used for document ids.
+
+    Callers supply their own fallback for an empty result. Two files whose names
+    slug to the same value are disambiguated by the ingester rather than silently
+    overwriting each other.
+    """
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
 def tokenize(text: str) -> list[str]:
     """Lowercase alphanumeric tokens. Punctuation carries no signal for BM25 here."""
     return _WORD_RE.findall(text.lower())
